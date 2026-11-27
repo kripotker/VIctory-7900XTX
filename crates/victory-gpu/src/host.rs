@@ -357,7 +357,10 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     let mine = ASKED.fetch_add(1, Ordering::AcqRel) + 1;
     let started = std::time::Instant::now();
     let mut aside = ASIDE.lock().unwrap_or_else(|e| e.into_inner());
-    if COVERED.load(Ordering::Acquire) >= mine {
+    static BATCH: OnceLock<bool> = OnceLock::new();
+    if *BATCH.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BATCH").is_none_or(|v| v != "0"))
+        && COVERED.load(Ordering::Acquire) >= mine
+    {
         return Ok(());
     }
     let covers = ASKED.load(Ordering::Acquire);

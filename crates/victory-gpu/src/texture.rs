@@ -107,6 +107,11 @@ struct Last {
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
     hot_until: u64,
+    /// Last read through the kernel while the runtime remapped title memory
+    /// ([`no_wait`]): pages of it may have been the ones about to go (a
+    /// view is changed a run of pages at a time), so it is read again under
+    /// the lock, a texture read once too.
+    unsettled: bool,
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
@@ -1249,7 +1254,7 @@ impl Staging {
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
         let alone = self.once.load(std::sync::atomic::Ordering::Relaxed);
-        if alone && last.hash.is_some() {
+        if alone && last.hash.is_some() && !last.unsettled {
             return 0;
         }
         if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
@@ -1327,6 +1332,7 @@ impl Staging {
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
+        last.unsettled = false;
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -1416,12 +1422,18 @@ impl Staging {
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
-                self.keep_whole(read);
+                // Not given to the store: it may hold pages of the old mapping.
             }
             true
         });
         if read {
             UNLOCKED[0].fetch_add(1, Relaxed);
+            // Read again under the lock at the next refresh: a texture read
+            // once (and a guarded one the guard saw no write to) was passed
+            // over from here on with pages the remap took away (the neon 4x4
+            // blocks on the boat's floral shirt, Series X, runs xb14, base3).
+            last.unsettled = true;
+            last.asked = 0;
             size
         } else if last.hash.is_none() && fill_unlocked() {
             self.fill(last, size)

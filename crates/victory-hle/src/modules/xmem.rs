@@ -1318,7 +1318,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         {
             run += PAGE;
         }
-        if run > PAGE && join_placeholders(&mut physical, to + k, run) && map(&mut physical, to + k, run, slice.clone()) {
+        if run > PAGE && alias_runs() && join_placeholders(&mut physical, to + k, run) && map(&mut physical, to + k, run, slice.clone()) {
             k += run;
             continue;
         }
@@ -1333,6 +1333,12 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         k += run;
     }
     true
+}
+
+/// Whether [`map_alias`] maps runs of pages as one view (`VICTORY_ALIAS_RUNS=0`: page by page).
+fn alias_runs() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_ALIAS_RUNS").is_none_or(|v| v != "0"));
+    *ON
 }
 
 /// Joins the placeholders that make up `[base, base + len)` into one (they
