@@ -304,6 +304,7 @@ fn start() {
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
+            #[cfg(all(windows, feature = "diagnostics"))]
             crate::timeline::our_thread();
             crate::queue::no_drain_here();
             loop {
