@@ -331,8 +331,9 @@ pub(crate) fn polled(at: usize, value: u64) {
     });
 }
 
-/// Threads of the title's that submit or present.
-static TITLES: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+/// Threads of the title's that submit or present, and with
+/// `VICTORY_TIMELINE_OURS=1` ours that translate and submit ([`our_thread`]).
+static TITLES: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
 
 /// This thread is one of the title's that submit: what it does is sampled.
 #[inline(always)]
@@ -340,7 +341,22 @@ pub(crate) fn title_thread() {
     if !on() {
         return;
     }
-    let id = thread();
+    note_sampled(thread());
+}
+
+/// With `VICTORY_TIMELINE_OURS=1`, this thread of ours is sampled as the
+/// title's are ([`title_thread`]): where our list translation and
+/// submitting spend their time, which spans alone do not say.
+pub(crate) fn our_thread() {
+    static OURS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // (Noted whether or not the recording is on yet: these threads start
+    // long before it and ask once.)
+    if *OURS.get_or_init(|| std::env::var_os("VICTORY_TIMELINE_OURS").is_some_and(|v| v != "0")) {
+        note_sampled(thread());
+    }
+}
+
+fn note_sampled(id: u32) {
     for place in &TITLES {
         match place.load(Ordering::Relaxed) {
             there if there == id => return,
