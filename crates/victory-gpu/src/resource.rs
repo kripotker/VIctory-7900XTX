@@ -2162,15 +2162,18 @@ pub(crate) fn let_go_idle() {
                 std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
                     && (crate::host::long_ago(used, idle_ms, IDLE_FRAMES)
-                        // A few frames idle are enough in a block being
-                        // drained, and (where the card's memory is the PC's)
-                        // for a placed texture whose memory the title gave
-                        // up: 464 MB of them stayed for minutes (run
-                        // ram11-s-half-tails).
-                        || (host.block.is_some_and(crate::pool::draining)
-                            || crate::pool::drains()
-                                && r.host.placed.load(Relaxed)
-                                && !crate::texture::committed(r.data().cast_const(), 1)))
+                        // Three seconds idle are enough in a block being
+                        // drained (four frames let go and made again 3.3 GB
+                        // of copies used every few frames, with frames of up
+                        // to 1.4 s: Series X, run x-final), and a few frames
+                        // (where the card's memory is the PC's) for a placed
+                        // texture whose memory the title gave up: 464 MB of
+                        // them stayed for minutes (run ram11-s-half-tails).
+                        || host.block.is_some_and(crate::pool::draining)
+                            && crate::host::long_ago(used, 3_000, 90)
+                        || crate::pool::drains()
+                            && r.host.placed.load(Relaxed)
+                            && !crate::texture::committed(r.data().cast_const(), 1))
             });
             if idle {
                 // Under the lock: the next use must not find the staging
@@ -2237,14 +2240,20 @@ fn move_from_drained(all: &std::collections::BTreeSet<usize>) {
             continue;
         }
         let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        // Only a copy whose fill was sent: one moved before that (made for a
+        // slot, its upload or its own copy from a moved one still to come)
+        // passed on what its memory held before, and its fill went to the
+        // copy let go (a shirt in other textures' colours, run shirt-k).
         let movable = made.as_ref().is_some_and(|(host, twin)| {
             twin.is_none()
                 && host.tiled.is_none()
                 && host.block.is_some_and(crate::pool::draining)
                 && !r.host.grown.load(Relaxed)
                 && !host.grown.load(Relaxed)
+                && host.holds.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+                && host.ahead.load(Relaxed) != crate::texture::ahead::PENDING
                 && crate::host::references(&host.texture) > 1
-        });
+        }) && r.host.moved_from.lock().unwrap_or_else(|e| e.into_inner()).is_none();
         if !movable {
             continue;
         }

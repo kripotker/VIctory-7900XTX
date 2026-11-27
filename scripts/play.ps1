@@ -36,9 +36,10 @@ if ($LowMemory) {
     # Linux/Proton (RADV), 7900 XTX: 132.7 ms a frame, was 52.0 (PR #206).
     $settings.VICTORY_PORT_ALL = '1'; $settings.VICTORY_WINDOW_KB = '64'; $settings.VICTORY_INPLACE = '1'; $settings.VICTORY_RESIDENCY = '1'
     # Texture blocks of 16 MiB, 4 made ahead, and windows asked for without a length cut on 64 KiB too; with the residency
-    # switch the pool's blocks under three quarters used are drained and the textures slots hold moved out on the card
-    # (pool.rs `drain`), and staging blocks are 16 MiB. Series S at the boat: RAM 15.9 GB + card 7.8 GB = 23.7 GB,
-    # 39.9 ms a frame (run shirt-j; was 16.2 + 11.7 = 27.9 GB, 41.3 ms without these, run shirt-a).
+    # switch the pool's emptiest blocks are drained and the textures slots hold moved out on the card (pool.rs `drain`),
+    # and staging blocks are 16 MiB. Series S at the boat: RAM 15.5-15.8 GB + card 7.7 GB = 23.1-23.5 GB, 39-40 ms a
+    # frame (runs shirt-l, shirt-m; was 16.2 + 11.7 = 27.9 GB, 41.3 ms without these, run shirt-a). Series X: 27.0-27.6
+    # GB, at the edge of a 32 GB PC (runs x-final2, x-final3).
     $settings.VICTORY_TEXTURE_BLOCK_MB = '16'; $settings.VICTORY_RIPE_BLOCKS = '4'; $settings.VICTORY_WINDOW_TAILS = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }

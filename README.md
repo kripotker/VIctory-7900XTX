@@ -69,7 +69,7 @@ scripts\play.ps1 -Exe <path of your copy's executable>
 something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
 `-LowMemory` has the card read the game's memory where it is instead of from
 copies and keeps texture memory packed, meant for integrated graphics that share
-the PC's memory: with `-Console series-s`, 23.7 GB in all (15.9 GB RAM, 7.8 GB
+the PC's memory: with `-Console series-s`, 23.5 GB in all (15.8 GB RAM, 7.7 GB
 of the card's) at the opening's boat scene, against 27.9 GB without it. On a
 card of its own it can be much slower (2.5 times on Linux/Proton with RADV), so
 it is off by default. `-Console series-s` runs the smaller

@@ -755,9 +755,10 @@ pub(crate) fn any_draining() -> bool {
 static DRAINING: std::sync::RwLock<Vec<bool>> = std::sync::RwLock::new(Vec::new());
 
 /// Marks the blocks to drain, once a second ([`room`]): with more than
-/// [`DRAIN_FREE`] free in the texture blocks, those less than three
-/// quarters used (a quarter left 1.3 GB free in blocks of 4.1 GB, run
-/// ram10-s-move; a half 770 MB in 4.3 GB, run shirt-f). After the world
+/// [`DRAIN_FREE`] free in the texture blocks, the emptiest of those less
+/// than three quarters used, as many as hold the free bytes past that line
+/// (blocks under a quarter left 1.3 GB free in blocks of 4.1 GB, run
+/// ram10-s-move; under a half 770 MB in 4.3 GB, run shirt-f). After the world
 /// loads, tens of thousands of textures go idle and are let go, and the few
 /// still used lie in nearly every block: run ram4-held kept 6.9 GB of blocks
 /// for 1.5 GB of textures. New textures go elsewhere while there is room,
@@ -786,14 +787,32 @@ fn mark_drained<B>(pool: &mut Pool<B>, on: bool) {
     let size = pool.block;
     let used = |b: &Block<B>| size - b.free.0.values().sum::<u64>();
     let free: u64 = pool.blocks.iter().flatten().map(|b| size - used(b)).sum();
-    let drain = on && free > DRAIN_FREE;
-    let mut marks = Vec::with_capacity(pool.blocks.len());
-    for block in &mut pool.blocks {
-        let marked = block.as_mut().is_some_and(|b| {
-            b.draining = drain && used(b) * 4 < size * 3 && !b.free.whole(size);
-            b.draining
-        });
-        marks.push(marked);
+    // The emptiest first, until what they have free makes up what is free
+    // past the line: each byte freed costs the fewest bytes moved. (All
+    // blocks under three quarters at once moved 4.8 GB in seven minutes,
+    // the same textures again and again, with frames of 100 to 600 ms in
+    // the opening: Series X, run x-final2.)
+    let mut excess = if on { free.saturating_sub(DRAIN_FREE) } else { 0 };
+    let mut order: Vec<(u64, usize)> = pool
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| b.as_ref().filter(|b| !b.free.whole(size)).map(|b| (used(b), i)))
+        .filter(|&(u, _)| u * 4 < size * 3)
+        .collect();
+    order.sort_unstable();
+    let mut marks = vec![false; pool.blocks.len()];
+    for (u, i) in order {
+        if excess == 0 {
+            break;
+        }
+        marks[i] = true;
+        excess = excess.saturating_sub(size - u);
+    }
+    for (block, &marked) in pool.blocks.iter_mut().zip(&marks) {
+        if let Some(b) = block {
+            b.draining = marked;
+        }
     }
     *DRAINING.write().unwrap_or_else(|e| e.into_inner()) = marks;
 }
@@ -909,30 +928,36 @@ mod tests {
 
     #[test]
     fn nearly_empty_blocks_are_drained_and_new_pieces_go_elsewhere() {
-        // Ten blocks, each with one small piece left: 600 MB free, past the
-        // line, so all are drained.
+        // Ten blocks of 64 MiB, block i holding i + 1 pieces of 4 MiB: 420 MiB
+        // free, 164 past the line, which the three emptiest make up.
         let mut pool: Pool<u32> = Pool::new(16);
         let small = BLOCK / 16;
-        let mut pieces = Vec::new();
         for i in 0..10 {
             pool.add(i, 0);
-            pieces.push(pool.blocks[i as usize].as_mut().unwrap().free.take(small, 1).unwrap());
+            for _ in 0..=i {
+                pool.blocks[i as usize].as_mut().unwrap().free.take(small, 1).unwrap();
+            }
         }
+        let drained = |pool: &Pool<u32>| -> Vec<usize> {
+            (0..10).filter(|&i| pool.blocks[i].as_ref().unwrap().draining && draining(i)).collect()
+        };
         mark_drained(&mut pool, true);
-        assert!(pool.blocks.iter().flatten().all(|b| b.draining));
-        assert!((0..10).all(draining));
-        // One filled to more than three quarters is not drained.
-        pool.blocks[3].as_mut().unwrap().free.take(BLOCK * 3 / 4, 1).unwrap();
+        assert_eq!(drained(&pool), [0, 1, 2]);
+        // One filled to more than three quarters is not drained: the next
+        // emptiest are.
+        pool.blocks[0].as_mut().unwrap().free.take(BLOCK * 3 / 4, 1).unwrap();
         mark_drained(&mut pool, true);
-        assert!(!pool.blocks[3].as_ref().unwrap().draining && !draining(3));
-        // A new piece goes into the block not drained, though the drained
-        // ones before it have room.
-        let (piece, memory, _) = pool.take(small, 1, 0, || panic!("no block needed")).unwrap();
-        assert_eq!((piece.block, memory), (3, 3));
+        assert_eq!(drained(&pool), [1, 2, 3]);
+        // A new piece goes into a block not drained, though the drained ones
+        // before it have room (block 0 has too little).
+        let (piece, memory, _) = pool.take(4 * small, 1, 0, || panic!("no block needed")).unwrap();
+        assert_eq!((piece.block, memory), (4, 4));
         // Only drained blocks with room: one of them is used, not a new one.
-        pool.blocks[3].as_mut().unwrap().free = Ranges(BTreeMap::new());
+        for i in [0, 4, 5, 6, 7, 8, 9] {
+            pool.blocks[i].as_mut().unwrap().free = Ranges(BTreeMap::new());
+        }
         let (piece, _, _) = pool.take(small, 1, 0, || panic!("no block needed")).unwrap();
-        assert_ne!(piece.block, 3);
+        assert!((1..=3).contains(&piece.block));
         // Little free: none is drained.
         let mut full: Pool<u32> = Pool::new(16);
         full.add(0, 0);
