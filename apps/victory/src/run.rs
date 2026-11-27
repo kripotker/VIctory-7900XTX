@@ -243,11 +243,35 @@ pub fn run(
     Ok(())
 }
 
+/// `VICTORY_STALL_STACKS=<ms>`: the stacks of every thread when no frame was
+/// presented for that long, once a stall (at most 16 times).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn stall_stacks() {
+    let Some(ms) = std::env::var("VICTORY_STALL_STACKS").ok().and_then(|v| v.trim().parse::<u64>().ok()) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let (mut dumped, mut times) = (false, 0);
+        while times < 16 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let since = victory_hle::since_present_ms();
+            if since >= ms && !dumped {
+                eprintln!("VIctory: no frame presented for {since} ms");
+                victory_loader::dump_stacks();
+                (dumped, times) = (true, times + 1);
+            } else if since < ms {
+                dumped = false;
+            }
+        }
+    });
+}
+
 /// The debugging aids (README): scheduled stack dumps, watched values and
 /// memory saved on a crash.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::dump_stacks_on_schedule();
+    stall_stacks();
     victory_loader::profile_on_schedule(victory_hle::frame_phase);
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);

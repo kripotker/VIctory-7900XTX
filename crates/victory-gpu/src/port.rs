@@ -101,13 +101,46 @@ struct Region {
 // SAFETY: D3D12 heaps are free-threaded.
 unsafe impl Send for Region {}
 
-static REGIONS: Mutex<Vec<Region>> = Mutex::new(Vec::new());
+/// By (start, end): ordered, so that the regions over an address are found
+/// without a walk over all (thousands of them, looked through at every
+/// buffer placed and every page the title remaps).
+static REGIONS: Mutex<std::collections::BTreeMap<(u64, u64), Region>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// The regions that may hold `[at, end)`: those starting at most [`MOST`] below.
+fn holding(regions: &std::collections::BTreeMap<(u64, u64), Region>, at: u64, end: u64) -> Option<(u64, u64)> {
+    regions
+        .range((at.saturating_sub(MOST), 0)..=(at, u64::MAX))
+        .map(|(k, _)| *k)
+        .find(|&(start, stop)| start <= at && end <= stop)
+}
 
 /// Regions forgotten ([`forget`]) whose heap may still have buffers in it:
 /// the heap holds the pages of our view, which is unmapped after it goes.
 /// With windows on a 64 KiB grid the title's remapping forgets thousands of
 /// regions (12,993 in run xtx-fine64), each a view of ours.
 static RETIRED: Mutex<Vec<Region>> = Mutex::new(Vec::new());
+
+/// Counts [`forget`]s that reached the regions: a region opened outside the
+/// lock while one ran is not kept.
+static FORGOTTEN: AtomicU64 = AtomicU64::new(0);
+
+/// The last [`forget`]s: their count and range.
+static RECENT: Mutex<Vec<(u64, u64, u64)>> = Mutex::new(Vec::new());
+const RECENT_MOST: usize = 256;
+
+/// Whether a [`forget`] since the count `since` touched `[start, end)` (or
+/// too many came to tell).
+fn remapped_since(since: u64, start: u64, end: u64) -> bool {
+    let recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    let now = FORGOTTEN.load(Ordering::Acquire);
+    if now == since {
+        return false;
+    }
+    if recent.first().is_none_or(|&(n, ..)| n > since) {
+        return true;
+    }
+    recent.iter().any(|&(n, at, to)| n >= since && at < end && to > start)
+}
 
 /// The lowest start and highest end of every region (both 0: none), for a
 /// quick look on the paths that run thousands of times a frame.
@@ -166,20 +199,41 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
     let at = start & !(K64 - 1);
     let end = (start + len.max(1)).next_multiple_of(K64);
     let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
-    let i = match regions.iter().position(|r| r.start <= at && end <= r.end) {
-        Some(i) => i,
+    let key = match holding(&regions, at, end) {
+        Some(key) => key,
         None => {
+            // Opened outside the lock (a millisecond each in the driver): the
+            // heap pass's threads opened 2,000 of them one after another,
+            // a frame of 5.5 s as the opening loaded (Series X, run xb1).
+            drop(regions);
+            let forgotten = FORGOTTEN.load(Ordering::Acquire);
             let region = open_region(device, at, end)?;
-            regions.push(region);
-            let n = regions.len() - 1;
-            let r = &regions[n];
-            STATS[0].fetch_add(1, Ordering::Relaxed);
-            STATS[1].fetch_add(r.end - r.start, Ordering::Relaxed);
-            bounds(&regions);
-            n
+            regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+            if remapped_since(forgotten, region.start, region.end) {
+                // The title mapped other pages meanwhile: the stretch may be stale.
+                RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(region);
+                return Err((5, "the title's memory changed while it was opened".to_owned()));
+            }
+            match holding(&regions, at, end) {
+                // Another thread opened one meanwhile: ours goes.
+                Some(key) => {
+                    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(region);
+                    key
+                }
+                None => {
+                    let key = (region.start, region.end);
+                    STATS[0].fetch_add(1, Ordering::Relaxed);
+                    STATS[1].fetch_add(region.end - region.start, Ordering::Relaxed);
+                    if let Some(old) = regions.insert(key, region) {
+                        RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(old);
+                    }
+                    bounds(&regions);
+                    key
+                }
+            }
         }
     };
-    let region = &regions[i];
+    let region = &regions[&key];
     let buffer = crate::inplace::place(device, &region.heap, at - region.start, end - at).map_err(|e| (6, format!("no buffer placed in the region: {e}")))?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
@@ -189,6 +243,7 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
 /// Opens the stretch around `[at, end)` (64 KiB aligned) as a heap through
 /// a view of ours of the same pages.
 fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
+    let _busy = crate::host::Busy(1, std::time::Instant::now());
     let Some((first, bytes, section, offset)) = stretch(at as usize, (end - at) as usize) else {
         return Err((3, format!("not one stretch of a section: {:?}", cover(at as usize, (end - at) as usize))));
     };
@@ -225,6 +280,9 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     }
     match crate::inplace::open(device, crate::inplace::From::Part(view, bytes as usize)) {
         Ok(heap) => {
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            let n = SAID.fetch_add(1, Ordering::Relaxed);
+            if n < 32 || n.is_power_of_two() {
             tracing::info!(
                 start = format_args!("{first:#x}"),
                 bytes,
@@ -233,6 +291,7 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
                 view = format_args!("{view:#x}"),
                 "renderer port 1: a stretch of the title's graphics memory opened as a host heap through a view of ours"
             );
+            }
             Ok(Region { start: first, end: first + bytes, heap, view })
         }
         Err(e) => {
@@ -257,28 +316,46 @@ fn committed(at: usize, len: usize) -> bool {
     true
 }
 
-fn bounds(regions: &[Region]) {
-    let lo = regions.iter().map(|r| r.start).min().unwrap_or(0);
-    let hi = regions.iter().map(|r| r.end).max().unwrap_or(0);
+/// The lowest start and (never lower than before) the highest end.
+fn bounds(regions: &std::collections::BTreeMap<(u64, u64), Region>) {
+    let lo = regions.keys().next().map_or(0, |k| k.0);
+    let hi = regions.keys().next_back().map_or(0, |k| k.1);
     BOUNDS[0].store(lo, Ordering::Relaxed);
-    BOUNDS[1].store(hi, Ordering::Relaxed);
+    BOUNDS[1].fetch_max(hi, Ordering::Relaxed);
 }
 
 /// The title maps other pages at `[at, at + len)`: the regions over it are
 /// forgotten (what is placed in them is let go by the caller).
 pub(crate) fn forget(at: usize, len: usize) {
     let (at, end) = (at as u64, (at as u64).saturating_add(len as u64));
+    {
+        let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+        let n = FORGOTTEN.fetch_add(1, Ordering::AcqRel);
+        if recent.len() >= RECENT_MOST {
+            recent.remove(0);
+        }
+        recent.push((n, at, end));
+    }
     if BOUNDS[1].load(Ordering::Relaxed) <= at || BOUNDS[0].load(Ordering::Relaxed) >= end {
         return;
     }
     let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
-    let (gone, kept): (Vec<Region>, Vec<Region>) = std::mem::take(&mut *regions).into_iter().partition(|r| r.end > at && r.start < end);
-    *regions = kept;
+    let keys: Vec<(u64, u64)> =
+        regions.range((at.saturating_sub(MOST), 0)..(end, 0)).map(|(k, _)| *k).filter(|&(start, stop)| stop > at && start < end).collect();
+    let gone: Vec<Region> = keys.iter().filter_map(|k| regions.remove(k)).collect();
     STATS[7].fetch_add(gone.len() as u64, Ordering::Relaxed);
     bounds(&regions);
     drop(regions);
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).extend(gone);
-    sweep();
+    // Retired regions go once nothing is placed in them: looked at with each
+    // forgetting that retires one, else a few times a second (every page the
+    // title remaps comes here).
+    static SWEPT: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::coarse_ms();
+    if !gone.is_empty() || now >= SWEPT.load(Ordering::Relaxed) + 250 {
+        SWEPT.store(now, Ordering::Relaxed);
+        RETIRED.lock().unwrap_or_else(|e| e.into_inner()).extend(gone);
+        sweep();
+    }
 }
 
 /// The references to `heap` there are, ours included.

@@ -2096,7 +2096,10 @@ pub(crate) fn let_go_idle() {
     // system memory is commit too. Short of it (`VICTORY_RESIDENCY=1`), idle
     // copies go after seconds, not the 10 minutes room on the card keeps them.
     let (idle_ms, most) = match memory {
-        _ if crate::residency::pressured() => (5_000, u64::MAX),
+        // Oldest first and 512 MB a sweep: all those idle 5 s at once (with no
+        // limit) were let go and made again in the next seconds, with frames
+        // of 1-6 s (Series X, runs x-final3, xb0).
+        _ if crate::residency::pressured() => (10_000, 512 << 20),
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()

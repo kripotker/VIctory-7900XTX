@@ -824,7 +824,11 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
     });
-    let shadow = crate::shadow::find(address, 1)?;
+    // A constant buffer asks for its 64 KiB (outside buffer objects, of a
+    // window that holds them already): asked without a length it made a
+    // window on to its 4 MiB cell's end, 418 of them 1.2 GB of copies at the
+    // boat (Series X, run x-final3).
+    let shadow = if srv { crate::shadow::find(address, 1) } else { crate::shadow::find_any(address, 1 << 16) }?;
     let len = shadow
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
@@ -1008,7 +1012,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             copies = spans.len(),
             mb = bytes >> 20,
             ms = started.elapsed().as_millis(),
-            "buffer views of the heap made ready for shaders that pick them by index"
+            busy_ms = ?[0, 1, 2].map(|i| crate::host::BUSY_US[i].load(Ordering::Relaxed) / 1000),
+            "buffer views of the heap made ready for shaders that pick them by index (busy: ms since the start making shared buffers, opening title memory, making upload buffers)"
         );
     }
     found

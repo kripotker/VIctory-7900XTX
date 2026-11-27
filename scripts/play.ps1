@@ -41,6 +41,8 @@ if ($LowMemory) {
     # frame (runs shirt-l, shirt-m; was 16.2 + 11.7 = 27.9 GB, 41.3 ms without these, run shirt-a). Series X: 27.0-27.6
     # GB, at the edge of a 32 GB PC (runs x-final2, x-final3).
     $settings.VICTORY_TEXTURE_BLOCK_MB = '16'; $settings.VICTORY_RIPE_BLOCKS = '4'; $settings.VICTORY_WINDOW_TAILS = '1'
+    # Device-removed data with the faulting address only, no breadcrumbs: 0.2-0.3 GB less RAM (Series X, run xb4).
+    $settings.VICTORY_D3D12_DRED = 'faults'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }

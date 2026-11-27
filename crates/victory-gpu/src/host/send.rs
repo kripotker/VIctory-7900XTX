@@ -119,8 +119,10 @@ unsafe impl Send for Memory {}
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
+/// (768 MB of the PC's kept ~0.6 GB of write-combined memory idle at the boat,
+/// Series X; submissions take 8-16 MB, ~18 a frame, so 192 MB covers a frame.)
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    if on_card() { 256 << 20 } else { 192 << 20 }
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through

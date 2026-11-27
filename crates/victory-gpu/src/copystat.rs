@@ -462,6 +462,33 @@ fn big_blocks() -> String {
     if text.is_empty() { "none".into() } else { text.join(", ") }
 }
 
+/// Allocation bases our small blocks were seen in (one block in 1024 looked
+/// up): the process heap's segments, for the census (`crate::alive`).
+pub(crate) static HEAP_BASES: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
+
+fn heap_sample(at: *mut u8) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if !N.fetch_add(1, Relaxed).is_multiple_of(1024) {
+        return;
+    }
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data the query fills in; no allocation here.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+        return;
+    }
+    let base = info.AllocationBase as u64;
+    let mut slot = (base >> 16) as usize % HEAP_BASES.len();
+    for _ in 0..HEAP_BASES.len() {
+        match HEAP_BASES[slot].compare_exchange(0, base, Relaxed, Relaxed) {
+            Ok(_) => return,
+            Err(there) if there == base => return,
+            Err(_) => slot = (slot + 1) % HEAP_BASES.len(),
+        }
+    }
+}
+
 /// The system's allocator with every block counted in [`OWN`] (two atomic
 /// additions per allocation and per release: diagnostics builds only).
 struct Counting;
@@ -475,6 +502,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
+            heap_sample(at);
         }
         at
     }
@@ -980,6 +1008,15 @@ fn log_memory() {
         "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
         crate::resource::placed_filler_twins()
     );
+    {
+        // Every 30 s: whose the private memory is.
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = now_us();
+        if now >= LAST.load(Relaxed) + 30_000_000 {
+            LAST.store(now, Relaxed);
+            crate::alive::census();
+        }
+    }
     // What the line above leaves open: what is alive of the buffers "made
     // so far", what the windows hold and what holds them, and what our own
     // code has allocated.

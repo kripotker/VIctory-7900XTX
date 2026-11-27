@@ -252,6 +252,7 @@ fn fresh_list() -> Option<crate::host::HostList> {
         if let Some(Idle(_, bytes)) = &taken {
             idle.1 -= bytes;
         }
+        IDLE_LOW.fetch_min(idle.0.len(), std::sync::atomic::Ordering::Relaxed);
         taken
     };
     match idle {
@@ -286,7 +287,46 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
             idle.1 += bytes;
         }
     }
+    trim_idle();
 }
+
+/// Host lists idle now (for the memory census).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn idle_lists() -> usize {
+    IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len()
+}
+
+/// The fewest host lists idle since the last trim.
+#[cfg(windows)]
+static IDLE_LOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Once a second, host lists that stayed idle the whole second beyond
+/// [`IDLE_FLOOR`] go, coldest first and a few at a time (freeing costs the
+/// graphics kernel time): each keeps its allocators' memory, ~1.2 MB of the
+/// driver's, and after a burst hundreds sat idle for the rest of the run.
+#[cfg(windows)]
+fn trim_idle() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Relaxed);
+    if now < last + 1000 || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+        return;
+    }
+    let gone: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let spare = IDLE_LOW.swap(usize::MAX, Relaxed).min(idle.0.len()).saturating_sub(IDLE_FLOOR).min(64);
+        let gone: Vec<Idle> = idle.0.drain(..spare).collect();
+        idle.1 -= gone.iter().map(|Idle(_, b)| b).sum::<u64>();
+        IDLE_LOW.store(idle.0.len(), Relaxed);
+        gone
+    };
+    drop(gone);
+}
+
+/// Host lists always kept idle.
+#[cfg(windows)]
+const IDLE_FLOOR: usize = 48;
 
 /// A wait for a memory value recorded into list `this`, with waits cut
 /// into lists (`crate::queue::cuts`). On the console the queue runs the
@@ -397,16 +437,10 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
-        // into it until the title resets it.
+        // into it until the title resets it, which takes it a host list.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(host) = list.host.take() else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -469,17 +503,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
-        // into it until the title resets it.
+        // into it until the title resets it, which takes it a host list.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = (*list).host.take() else {
                 continue;
             };
             let uploads =
@@ -678,6 +706,16 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+        // A submission took its host list (and a title keeps ~600 lists closed
+        // between frames: each holding an idle one cost ~1.2 MB of the driver's
+        // memory apiece). Pooled ones are reset and open; the reset below wants
+        // it closed.
+        if list.host.is_none() {
+            list.host = fresh_list();
+            if let Some(host) = list.host.as_ref() {
+                host.close();
+            }
+        }
     }
     #[cfg(windows)]
     with_state(this, |host, state| {

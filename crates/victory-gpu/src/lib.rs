@@ -29,6 +29,8 @@ mod capture;
 mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
+mod alive;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
@@ -120,6 +122,13 @@ pub fn switched(switch: &str) -> Option<bool> {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub fn frame_phase() -> u32 {
     copystat::phase()
+}
+
+/// Milliseconds since the last frame was presented (0 before the first), for
+/// a watchdog of stalls.
+#[cfg(windows)]
+pub fn since_present_ms() -> u64 {
+    host::since_present_ms()
 }
 
 /// Frames the title has begun (its frame waits that ended), for logs.

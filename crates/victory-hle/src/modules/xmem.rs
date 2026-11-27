@@ -1298,19 +1298,56 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
-        let at = from + k;
-        let Some(slice) = physical.slice_at(at) else {
+    if from == 0 {
+        return true;
+    }
+    let mut k = 0;
+    while k < len {
+        let Some(slice) = physical.slice_at(from + k) else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
-            return false;
+        // A run of pages that follow one another in one section: one view,
+        // its placeholders joined first (page by page, a CopyPageMappings of
+        // a few hundred pages held the mapping lock for seconds while the
+        // lists' threads waited for it: frames of 1-5 s, Series X xb7).
+        let mut run = PAGE;
+        while k + run < len
+            && physical
+                .slice_at(from + k + run)
+                .is_some_and(|s| Arc::ptr_eq(&s.section, &slice.section) && s.index == slice.index + run / PAGE)
+        {
+            run += PAGE;
         }
+        if run > PAGE && join_placeholders(&mut physical, to + k, run) && map(&mut physical, to + k, run, slice.clone()) {
+            k += run;
+            continue;
+        }
+        for p in (k..k + run).step_by(PAGE) {
+            let Some(slice) = physical.slice_at(from + p) else {
+                return false;
+            };
+            if !map(&mut physical, to + p, PAGE, slice) {
+                return false;
+            }
+        }
+        k += run;
     }
     true
+}
+
+/// Joins the placeholders that make up `[base, base + len)` into one (they
+/// must lie wholly inside it): false if the host refuses.
+fn join_placeholders(physical: &mut Physical, base: usize, len: usize) -> bool {
+    if physical.holes.get(&base) == Some(&len) {
+        return true;
+    }
+    // SAFETY: acts only on placeholders; refused otherwise.
+    let joined = counted(Call::Split, || unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE | 1 /* MEM_COALESCE_PLACEHOLDERS */) }) != 0;
+    if joined {
+        physical.holes.retain(|&at, _| at < base || at >= base + len);
+        physical.holes.insert(base, len);
+    }
+    joined
 }
 
 /// [`map_alias`] of many ranges, in order.

@@ -108,6 +108,89 @@ enum Retired {
 unsafe impl Send for Retired {}
 
 /// Milliseconds since the first call.
+/// Microseconds spent making shared buffers [0], opening title memory as heaps
+/// [1], making upload buffers [2], since the start (for the heap pass's line).
+pub(crate) static BUSY_US: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Adds its lifetime to [`BUSY_US`]`[.0]`.
+pub(crate) struct Busy(pub(crate) usize, pub(crate) std::time::Instant);
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        BUSY_US[self.0].fetch_add(self.1.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// `VICTORY_FRAME_TIMES=<file>`: each present's time in microseconds, one a line, for percentiles and spikes.
+static LAST_PRESENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn since_present_ms() -> u64 {
+    let last = LAST_PRESENT.load(Ordering::Relaxed);
+    if last == 0 { 0 } else { now_us().saturating_sub(last) / 1000 }
+}
+
+pub(crate) fn frame_times() {
+    let now = now_us();
+    use std::io::Write;
+    let last = LAST_PRESENT.swap(now, Ordering::Relaxed);
+    if last != 0 && now - last > 300_000 {
+        tracing::warn!(ms = (now - last) / 1000, "a long frame");
+    }
+    static OUT: std::sync::LazyLock<Option<std::sync::Mutex<(std::io::BufWriter<std::fs::File>, u32)>>> =
+        std::sync::LazyLock::new(|| {
+            let path = std::env::var_os("VICTORY_FRAME_TIMES")?;
+            Some(std::sync::Mutex::new((std::io::BufWriter::new(std::fs::File::create(path).ok()?), 0)))
+        });
+    let Some(out) = OUT.as_ref() else { return };
+    let mut out = out.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = writeln!(out.0, "{now}");
+    out.1 += 1;
+    if out.1 % 32 == 0 {
+        let _ = out.0.flush();
+    }
+}
+
+/// A list's budget words: 256 bytes of a shared buffer of [`BUDGET_CHUNK`]
+/// (one committed buffer each, 612 of them held ~300 MB of the PC's memory
+/// at the boat: Series X, census xb7). Given back when the list goes.
+pub(crate) struct BudgetSlot {
+    buffer: ID3D12Resource,
+    offset: u64,
+    /// The words' address in the mapping.
+    data: usize,
+}
+
+// SAFETY: a D3D12 object (free-threaded) and an address in its mapping.
+unsafe impl Send for BudgetSlot {}
+unsafe impl Sync for BudgetSlot {}
+
+const BUDGET_SLOT: u64 = 256;
+const BUDGET_CHUNK: u64 = 1 << 20;
+
+/// The free slots: buffer, its mapping, offset.
+static BUDGET_FREE: Mutex<Vec<(ID3D12Resource, usize, u64)>> = Mutex::new(Vec::new());
+
+fn budget_slot() -> Option<BudgetSlot> {
+    let mut free = BUDGET_FREE.lock().unwrap_or_else(|e| e.into_inner());
+    if free.is_empty() {
+        let (buffer, data) = host()?.shared_buffer(BUDGET_CHUNK)?;
+        name(&buffer, || "lists' indirect budgets".to_owned());
+        free.extend((0..BUDGET_CHUNK / BUDGET_SLOT).rev().map(|k| (buffer.clone(), data as usize, k * BUDGET_SLOT)));
+    }
+    let (buffer, data, offset) = free.pop()?;
+    let data = data + offset as usize;
+    // SAFETY: the slot's own bytes of a live mapping.
+    unsafe { std::ptr::write_bytes(data as *mut u8, 0, BUDGET_SLOT as usize) };
+    Some(BudgetSlot { buffer, offset, data })
+}
+
+impl Drop for BudgetSlot {
+    fn drop(&mut self) {
+        let base = self.data - self.offset as usize;
+        BUDGET_FREE.lock().unwrap_or_else(|e| e.into_inner()).push((self.buffer.clone(), base, self.offset));
+    }
+}
+
 pub(crate) fn now_ms() -> u64 {
     static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
     EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
@@ -265,8 +348,19 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     if !wait_resident() {
         return Ok(());
     }
+    // One wait covers all memory made before it was sent: callers that came
+    // while another waited need not send their own when a later wait went out
+    // after they came (the heap pass's threads made 10,000 windows one wait
+    // at a time under this lock: 50,400 waits, 9.4 s a run, Series X xb3).
+    static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static COVERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mine = ASKED.fetch_add(1, Ordering::AcqRel) + 1;
     let started = std::time::Instant::now();
     let mut aside = ASIDE.lock().unwrap_or_else(|e| e.into_inner());
+    if COVERED.load(Ordering::Acquire) >= mine {
+        return Ok(());
+    }
+    let covers = ASKED.load(Ordering::Acquire);
     // SAFETY: plain object creation; the objects the list names are kept.
     unsafe {
         if aside.is_none() {
@@ -319,6 +413,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
             WaitForSingleObject(a.event, INFINITE);
         }
     }
+    COVERED.fetch_max(covers, Ordering::AcqRel);
     let us = started.elapsed().as_micros() as u64;
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
     MAPPED[1].fetch_add(us, Ordering::Relaxed);
@@ -1321,7 +1416,7 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
     /// it what the clamp notes about mesh records. In memory the CPU maps.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    budget: OnceLock<Option<BudgetSlot>>,
     /// The same words in the card's own memory ([`card_budget`]), which the
     /// clamp uses instead when there is one: zeroed in the list before its
     /// first clamp, its notes copied to `budget` when the list closes.
@@ -7249,13 +7344,8 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
-            .budget
-            .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
-            })
-            .as_ref()?;
+        let slot = self.budget.get_or_init(budget_slot).as_ref()?;
+        let (buffer, data) = (&slot.buffer, &slot.data);
         let card = self.card_budget.get_or_init(|| self.make_card_budget()).as_ref();
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
@@ -7285,8 +7375,13 @@ impl HostList {
                 self.zero_card_budget(card);
             }
         }
-        // SAFETY: a live buffer.
-        Some(unsafe { card.unwrap_or(buffer).GetGPUVirtualAddress() })
+        // SAFETY: live buffers.
+        Some(unsafe {
+            match card {
+                Some(card) => card.GetGPUVirtualAddress(),
+                None => buffer.GetGPUVirtualAddress() + slot.offset,
+            }
+        })
     }
 
     /// The budget's words in the card's own memory ([`card_budget`]), if
@@ -7338,11 +7433,10 @@ impl HostList {
         if !self.deferred().budget_zeroed {
             return;
         }
-        let (Some(Some(card)), Some(Some((mapped, _)))) =
-            (self.card_budget.get(), self.budget.get())
-        else {
+        let (Some(Some(card)), Some(Some(slot))) = (self.card_budget.get(), self.budget.get()) else {
             return;
         };
+        let (mapped, offset) = (&slot.buffer, slot.offset);
         // SAFETY: an open list; both buffers are the list's own. The
         // mapped one is promoted from common to the copy destination.
         unsafe {
@@ -7351,7 +7445,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
+            self.list.CopyBufferRegion(mapped, offset + 4, card, 4, 16);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -8787,7 +8881,9 @@ impl Host {
         }
     }
 
+    #[track_caller]
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let _busy = Busy(2, std::time::Instant::now());
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -8831,6 +8927,7 @@ impl Host {
             && let Some(b) = &buffer
         {
             crate::book::made(b, || "an upload buffer".into());
+            crate::alive::track(b, data.cast(), size, std::panic::Location::caller());
         }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
@@ -8969,6 +9066,7 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        frame_times();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -9774,7 +9872,9 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    #[track_caller]
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let _busy = Busy(0, std::time::Instant::now());
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9822,6 +9922,7 @@ impl Host {
             && let Some(b) = &buffer
         {
             crate::book::made(b, || "a shared buffer".into());
+            crate::alive::track(b, data.cast(), size, std::panic::Location::caller());
         }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
