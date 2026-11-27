@@ -742,6 +742,10 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     if host_written {
         return;
     }
+    // A copy moved out of a drained block is filled from the old one.
+    if crate::resource::fill_moved(list, resource) {
+        return;
+    }
     // Once a list for each first level; not again for one that the list's
     // upload of larger ones held too.
     if !list.first_use(1 << 63 | (resource as usize) << 4 | first as usize & 15) {

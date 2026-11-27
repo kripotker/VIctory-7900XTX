@@ -35,6 +35,11 @@ if ($LowMemory) {
     # at the boat (run xtx-newdefaults): copies of game memory 2.0 GB, were 3.3; RAM 19.4 GB, was 20.4; 50-51 ms a frame.
     # Linux/Proton (RADV), 7900 XTX: 132.7 ms a frame, was 52.0 (PR #206).
     $settings.VICTORY_PORT_ALL = '1'; $settings.VICTORY_WINDOW_KB = '64'; $settings.VICTORY_INPLACE = '1'; $settings.VICTORY_RESIDENCY = '1'
+    # Texture blocks of 16 MiB, 4 made ahead, and windows asked for without a length cut on 64 KiB too; with the residency
+    # switch the pool's blocks under three quarters used are drained and the textures slots hold moved out on the card
+    # (pool.rs `drain`), and staging blocks are 16 MiB. Series S at the boat: RAM 15.9 GB + card 7.8 GB = 23.7 GB,
+    # 39.9 ms a frame (run shirt-j; was 16.2 + 11.7 = 27.9 GB, 41.3 ms without these, run shirt-a).
+    $settings.VICTORY_TEXTURE_BLOCK_MB = '16'; $settings.VICTORY_RIPE_BLOCKS = '4'; $settings.VICTORY_WINDOW_TAILS = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }

@@ -288,6 +288,25 @@ impl Drop for SyncedHeaps {
     }
 }
 
+/// What the host slots of all shader-visible heaps hold of the texture pool:
+/// slots, distinct textures, bytes (diagnostics; [`host::HostHeap::kept_pooled`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn kept_pooled() -> [u64; 3] {
+    let mut seen = std::collections::HashSet::new();
+    let mut sum = [0u64; 3];
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live while the lock is held.
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(Some(host)) = heap.host.get() {
+            for (s, n) in sum.iter_mut().zip(host.kept_pooled(&mut seen)) {
+                *s += n;
+            }
+        }
+    }
+    sum
+}
+
 /// Mirrors records copied directly into placed shader-visible heaps. Calls
 /// to `Create*View` are already mirrored by [`mirror`]; raw CPU copies leave
 /// only write-watch pages to reveal which slots changed.

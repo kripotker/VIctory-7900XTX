@@ -1181,6 +1181,8 @@ pub(crate) struct HostTexture {
     /// Made in place of one with fewer levels: the slots that show that one
     /// are made again once this one was filled whole.
     pub(crate) grown: std::sync::atomic::AtomicBool,
+    /// The texture pool's block it was cut from (`crate::pool::draining`).
+    pub(crate) block: Option<usize>,
     /// What the last submitted upload put in it.
     pub(crate) holds: std::sync::Arc<Holds>,
     /// Who makes its first upload (`crate::texture::ahead`).
@@ -1237,6 +1239,9 @@ struct Hosted {
     wanted: std::sync::atomic::AtomicU32,
     /// The next host copy takes the place of one with fewer levels.
     grown: std::sync::atomic::AtomicBool,
+    /// The host copy moved out of a drained block ([`move_from_drained`]):
+    /// the next one is made like it and filled from it on the card.
+    moved_from: std::sync::Mutex<Option<std::sync::Arc<HostTexture>>>,
 }
 
 /// Whether a texture the title places in memory is read, kept and uploaded
@@ -1585,12 +1590,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         const TEXTURE_2D: u32 = 3;
         let mut tiled = None;
         let mut texture = None;
+        // In place of one moved out of a drained block: made as that one
+        // was (its levels), and filled from it ([`fill_moved`]).
+        let moved = r.host.moved_from.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|old| old.base);
         let shape_fits = fills(&r.desc)
             && r.desc.dimension == TEXTURE_2D
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
-        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
+        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() && moved.is_none() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
             // What the upload can read: a console layout, no XOR mode
@@ -1615,9 +1623,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         // The levels views show ([`held_only`]), those of the slots shaders
         // pick by index among them.
-        let mut base = 0;
+        let mut base = moved.unwrap_or(0);
         let mut prefill = None;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        if moved.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
@@ -2144,15 +2152,25 @@ pub(crate) fn let_go_idle() {
         let r = unsafe { &*(at as *const Resource) };
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, 0, IDLE_FRAMES) || crate::texture::host_wrote(at) {
             continue;
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
+                let used = r.host.used.load(Relaxed);
+                std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
+                    && (crate::host::long_ago(used, idle_ms, IDLE_FRAMES)
+                        // A few frames idle are enough in a block being
+                        // drained, and (where the card's memory is the PC's)
+                        // for a placed texture whose memory the title gave
+                        // up: 464 MB of them stayed for minutes (run
+                        // ram11-s-half-tails).
+                        || (host.block.is_some_and(crate::pool::draining)
+                            || crate::pool::drains()
+                                && r.host.placed.load(Relaxed)
+                                && !crate::texture::committed(r.data().cast_const(), 1)))
             });
             if idle {
                 // Under the lock: the next use must not find the staging
@@ -2176,6 +2194,8 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
+    move_from_drained(&all);
+    drop(all);
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
@@ -2189,6 +2209,153 @@ pub(crate) fn let_go_idle() {
         });
     }
 }
+
+/// Host copies of placed textures in a block being drained (`crate::pool`)
+/// that descriptor slots hold, so that the sweep cannot let them go: each is
+/// made again (in a block not being drained) when its slots are next due,
+/// which is at once, and filled from the old one on the card
+/// ([`fill_moved`]); the slots show the new one once that copy has run,
+/// until then the old one. Some 256 MB of them a look (a second). Without this,
+/// the few textures still used after the world loaded kept nearly every
+/// block (run ram8-orphans: slots held 2.1 GB of textures in 4 GB of blocks).
+/// Since the start: textures moved, and their bytes ([`MOVED`]).
+#[cfg(windows)]
+fn move_from_drained(all: &std::collections::BTreeSet<usize>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const MOST: u64 = 256 << 20;
+    if !held_only() || !crate::pool::any_draining() || std::env::var_os("VICTORY_POOL_MOVE").is_some_and(|v| v == "0") {
+        return;
+    }
+    let mut bytes = 0;
+    for &at in all {
+        if bytes >= MOST {
+            break;
+        }
+        // SAFETY: as in `let_go_idle`, whose lock of the table is held.
+        let r = unsafe { &*(at as *const Resource) };
+        if !r.host.placed.load(Relaxed) || !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let movable = made.as_ref().is_some_and(|(host, twin)| {
+            twin.is_none()
+                && host.tiled.is_none()
+                && host.block.is_some_and(crate::pool::draining)
+                && !r.host.grown.load(Relaxed)
+                && !host.grown.load(Relaxed)
+                && crate::host::references(&host.texture) > 1
+        });
+        if !movable {
+            continue;
+        }
+        // Under the lock, as in `want_level`. The new copy is filled from
+        // the old one on the card, not from title memory, which the title
+        // may have written since without a word (a moved shirt came back in
+        // another texture's colours when it was: run ram12-s-final).
+        crate::texture::unstage(at as This);
+        if let Some(old) = made.take() {
+            bytes += old.0.bytes;
+            MOVED[0].fetch_add(1, Relaxed);
+            MOVED[1].fetch_add(old.0.bytes, Relaxed);
+            *r.host.moved_from.lock().unwrap_or_else(|e| e.into_inner()) = Some(old.0.clone());
+            REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
+        }
+        drop(made);
+        MOVES.lock().unwrap_or_else(|e| e.into_inner()).push(at);
+    }
+}
+
+/// Title textures moved out of drained blocks ([`move_from_drained`]) whose
+/// new host copy is still to be made and filled ([`fill_all_moved`]). Not
+/// their slots made due: that made every slot at the same start due, and
+/// another texture there uploaded again from title memory the host's
+/// contents never reached. A texture leaves it before it is freed.
+#[cfg(windows)]
+static MOVES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Makes and fills, in `list`, the host copies of the textures moved since
+/// the last call ([`fill_moved`]).
+#[cfg(windows)]
+pub(crate) fn fill_all_moved(list: &crate::host::HostList) {
+    // Held throughout: a texture released meanwhile waits to leave it.
+    let mut moves = MOVES.lock().unwrap_or_else(|e| e.into_inner());
+    for at in std::mem::take(&mut *moves) {
+        fill_moved(list, at as This);
+    }
+}
+
+/// Fills the host copy of `this` made in place of one moved out of a
+/// drained block ([`move_from_drained`]) from that one, in `list`: a copy on
+/// the card, after which its slots are made again from the new one (until
+/// then they show the old one). True: filled here or by another list, so
+/// nothing is to be uploaded from title memory; false: not a moved texture,
+/// or one made otherwise (it is filled as any new copy).
+#[cfg(windows)]
+pub(crate) fn fill_moved(list: &crate::host::HostList, this: This) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::Win32::Graphics::Direct3D12::*;
+    const COPY_DEST: u32 = 0x400;
+    const COPY_SOURCE: u32 = 0x800;
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER || r.host.moved_from.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+        return false;
+    }
+    // Made (like the old one) before it is taken: the making asks for it.
+    let Some(new) = host_copy(this) else {
+        return false;
+    };
+    let Some(old) = r.host.moved_from.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return true;
+    };
+    // Not uploaded ahead from title memory on a queue of its own meanwhile.
+    new.ahead.store(crate::texture::ahead::LISTED, Relaxed);
+    // SAFETY: live resources.
+    let (a, b) = unsafe { (old.texture.GetDesc(), new.texture.GetDesc()) };
+    if (a.Dimension, a.Width, a.Height, a.DepthOrArraySize, a.MipLevels, a.Format)
+        != (b.Dimension, b.Width, b.Height, b.DepthOrArraySize, b.MipLevels, b.Format)
+    {
+        return false;
+    }
+    // (As before a first upload: the new one may lie where another did.)
+    if crate::pool::on() && crate::pool::pooled(&new.texture) {
+        let aliasing = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                    pResourceBefore: std::mem::ManuallyDrop::new(None),
+                    // SAFETY: a borrowed pointer the barrier never releases.
+                    pResourceAfter: unsafe { std::mem::transmute_copy(&new.texture) },
+                }),
+            },
+        };
+        // SAFETY: an open list and a live texture.
+        unsafe { list.list.barriers(&[aliasing]) };
+    }
+    crate::list::ensure_state(list, this, COPY_DEST);
+    // The list's states hold the old one until it is reset.
+    list.settle(&old, COPY_SOURCE);
+    // SAFETY: an open list; both textures alive, of one description.
+    unsafe { list.list.CopyResource(&new.texture, &old.texture) };
+    // Once the list is submitted (one reset unsent never copied): the new
+    // copy holds what the old one did, and its slots show it after that.
+    let start = r.data() as u64;
+    list.defer_host(move || {
+        *new.holds.lock().unwrap_or_else(|e| e.into_inner()) = *old.holds.lock().unwrap_or_else(|e| e.into_inner());
+        new.prefilled.store(old.prefilled.load(Relaxed), Relaxed);
+        MOVED[2].fetch_add(1, Relaxed);
+        crate::descriptor::host::levels_changed_after(start);
+    });
+    true
+}
+
+/// Since the start: host copies moved out of drained blocks
+/// ([`move_from_drained`]), their bytes, and new copies filled from them.
+#[cfg(windows)]
+pub(crate) static MOVED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
 /// longest one's.
@@ -2340,7 +2507,9 @@ impl HostTexture {
         let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+        let block = crate::pool::block_of(&texture);
         HostTexture {
+            block,
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
@@ -2368,6 +2537,7 @@ impl HostTexture {
         // SAFETY: a live texture.
         let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
         HostTexture {
+            block: None,
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes: 0,
@@ -2749,6 +2919,7 @@ fn hand_out_resource(
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             grown: std::sync::atomic::AtomicBool::new(false),
+            moved_from: std::sync::Mutex::new(None),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
@@ -2784,6 +2955,12 @@ impl Drop for Resource {
             let address = std::ptr::from_ref::<Resource>(self) as usize;
             crate::texback::released(address);
             crate::texlate::gone(address);
+            {
+                let mut moves = MOVES.lock().unwrap_or_else(|e| e.into_inner());
+                if !moves.is_empty() {
+                    moves.retain(|&at| at != address);
+                }
+            }
             textures().remove(&address);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());

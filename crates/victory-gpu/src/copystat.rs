@@ -900,8 +900,25 @@ fn log_memory() {
         mb(card[3]),
     );
     {
-        let [textures, staging] = pool;
-        tracing::info!("memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers");
+        let [textures, staging, held, resting] = pool;
+        // (Every ten seconds: a look at every slot.)
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = crate::host::now_ms();
+        let slots = if now >= LAST.load(Relaxed) + 10_000 {
+            LAST.store(now, Relaxed);
+            let [slots, n, bytes] = crate::descriptor::kept_pooled();
+            format!("; descriptor slots hold {} MB of them in {n} textures ({slots} slots)", bytes >> 20)
+        } else {
+            String::new()
+        };
+        tracing::info!(
+            "memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures ({held} MB of pieces held by a texture \
+             still referenced, {resting} MB of pieces resting{slots}; {} textures {} MB moved out of drained blocks, {} filled on the card), {staging} MB of \
+             their staging buffers",
+            crate::resource::MOVED[0].load(Relaxed),
+            crate::resource::MOVED[1].load(Relaxed) >> 20,
+            crate::resource::MOVED[2].load(Relaxed)
+        );
     }
     let targets = crate::resource::targets_census();
     tracing::info!(

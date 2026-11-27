@@ -746,7 +746,13 @@ impl Spans {
     /// The first span that starts inside `[start, end)` past the first
     /// [`HEAD`] bytes of it.
     fn next_start(&self, start: u64, end: u64) -> Option<u64> {
-        self.by_start.range(start.saturating_add(HEAD)..end).next().map(|(at, _)| *at)
+        // (A range whose start is past its end panics: a texture shorter
+        // than the head has nothing past it.)
+        let from = start.saturating_add(HEAD);
+        if from >= end {
+            return None;
+        }
+        self.by_start.range(from..end).next().map(|(at, _)| *at)
     }
 
     /// The slots that hold a view of the texture at `start`.
@@ -2257,6 +2263,20 @@ impl HostHeap {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 continue;
             };
+            // Only slots whose texture has a host copy: another texture at
+            // the same start may have none now (let go), and making its view
+            // here would make an empty one that nothing fills, shown for good
+            // (a shirt in other textures' colours: runs shirt-c2, shirt-e).
+            let texture = match &view {
+                &View::Shader(resource, _) => Some(resource as crate::object::This),
+                View::Placed(false, resource, desc) if resource[0] != 1 => {
+                    crate::resource::texture_at(u64::from(desc[10]) | u64::from(desc[11]) << 32, resource)
+                }
+                _ => None,
+            };
+            if texture.is_some_and(|t| crate::resource::made_copy(t).is_none()) {
+                continue;
+            }
             if let Some(kept) = make(&view, self.at(slot)) {
                 self.put(slot);
                 self.keep(slot, kept);
@@ -2923,6 +2943,28 @@ impl HostHeap {
         if let Some(old) = old {
             crate::host::retire_resource(old);
         }
+    }
+
+    /// Of the textures cut from the pool, those this heap's slots hold, each
+    /// counted once across heaps by `seen`: slots, textures, bytes
+    /// (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn kept_pooled(&self, seen: &mut std::collections::HashSet<usize>) -> [u64; 3] {
+        use windows::core::Interface;
+        let mut out = [0u64; 3];
+        for slot in &self.kept {
+            let held = slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(texture) = held
+                && let Some(len) = crate::pool::pooled_len(&texture)
+            {
+                out[0] += 1;
+                if seen.insert(texture.as_raw() as usize) {
+                    out[1] += 1;
+                    out[2] += len;
+                }
+            }
+        }
+        out
     }
 
     /// What slot `index` views.

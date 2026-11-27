@@ -71,6 +71,9 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     if !crate::residency::on() {
         SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+        if let Ok(mut pool) = TEXTURES.try_lock() {
+            drain(&mut pool);
+        }
         return;
     }
     // (`VICTORY_RESIDENCY=1`, codec-d/cool_fox c64fc9b4/e94d277a: fewer
@@ -82,6 +85,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     let tick = now();
     if let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
+        drain(&mut pool);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
         let staging_limit = if crate::residency::critical_commit() {
@@ -89,7 +93,10 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         } else if pressure {
             1
         } else {
-            limit
+            // Staging blocks are the PC's memory, not the card's room: kept
+            // as many as texture blocks, 12 empty ones were 768 MB of RAM
+            // holding 67 MB of staging (run shirt-e).
+            limit.min(SPARE)
         };
         pool.reclaim(tick, staging_limit, true);
     }
@@ -222,6 +229,8 @@ struct Block<B> {
     /// When that was (ms).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     since: u64,
+    /// New pieces go elsewhere while another block has room ([`drain`]).
+    draining: bool,
 }
 
 struct Pool<B> {
@@ -279,13 +288,17 @@ impl<B: Clone> Pool<B> {
         }
         self.rested(now);
         let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
-                found = Some((i, start));
-                break;
+        // Blocks being drained last ([`drain`]).
+        'look: for draining in [false, true] {
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                if let Some(block) = block
+                    && block.draining == draining
+                    && ripe.is(block)
+                    && let Some(start) = block.free.take(len, align)
+                {
+                    found = Some((i, start));
+                    break 'look;
+                }
             }
         }
         if found.is_none() && ripe.ahead > 0 {
@@ -346,7 +359,7 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(self.block), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block { memory, free: Ranges::new(self.block), used_to: 0, made, since: crate::host::now_ms(), draining: false });
         i
     }
 
@@ -417,10 +430,18 @@ pub(crate) fn texture_room() -> u64 {
     (lock(&TEXTURES).blocks() as u64 * texture_block()).saturating_sub(HELD.load(Ordering::Relaxed))
 }
 
-/// For the memory line: blocks of textures and of staging buffers, in MiB.
+/// For the memory line: blocks of textures and of staging buffers, the
+/// textures' pieces held by a reference and those resting, in MiB.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn memory() -> [u64; 2] {
-    [lock(&TEXTURES).blocks() as u64 * (texture_block() >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
+pub(crate) fn memory() -> [u64; 4] {
+    let textures = lock(&TEXTURES);
+    let resting: u64 = textures.resting.iter().map(|(_, p)| p.len).sum();
+    [
+        textures.blocks() as u64 * (texture_block() >> 20),
+        lock(&STAGING).blocks() as u64 * (staging_block() >> 20),
+        HELD.load(Ordering::Relaxed) >> 20,
+        resting >> 20,
+    ]
 }
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
@@ -432,6 +453,14 @@ impl Drop for StagingPiece {
     }
 }
 
+/// The bytes of a block of staging buffers: 16 MiB with
+/// `VICTORY_RESIDENCY=1` (`play.ps1 -LowMemory`), where they are the PC's
+/// memory (the few staging buffers textures keep lay in seven blocks of
+/// 64 MiB, 448 MB for 59 MB, run shirt-i), else [`BLOCK`].
+fn staging_block() -> u64 {
+    if crate::residency::on() { 16 << 20 } else { BLOCK }
+}
+
 /// `bytes` of upload memory, all zeros: the buffer it lies in, where in
 /// that buffer, and its mapping. `None`: not pooled.
 pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPiece, ID3D12Resource, u64, *mut u8)> {
@@ -440,14 +469,14 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let (piece, memory, again) = lock(&STAGING).sized(staging_block()).take(bytes, 512, now(), || {
         // (`VICTORY_RESIDENCY=1`: no new block for a texture picked by index
         // while commit is short; those a draw samples now still get one.)
         let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
         if speculative && !crate::residency::allow_staging_growth(false) {
             return None;
         }
-        let (buffer, data) = host.upload_buffer(BLOCK)?;
+        let (buffer, data) = host.upload_buffer(staging_block())?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
     })?;
@@ -681,6 +710,97 @@ pub(crate) fn pooled(texture: &ID3D12Resource) -> bool {
     unsafe { texture.GetPrivateData(&KEY, &mut size, None) }.is_ok()
 }
 
+/// The piece `texture` was cut from, if it was cut from a block.
+fn piece_of(texture: &ID3D12Resource) -> Option<Piece> {
+    let mut size = std::mem::size_of::<*mut c_void>() as u32;
+    let mut object: *mut c_void = std::ptr::null_mut();
+    // SAFETY: the data under `KEY` is the interface `give_back_with` set:
+    // its pointer is written, with a reference taken, which is let go here.
+    unsafe {
+        texture.GetPrivateData(&KEY, &mut size, Some(std::ptr::from_mut(&mut object).cast())).ok()?;
+        if object.is_null() {
+            return None;
+        }
+        let piece = (*object.cast::<Reclaim>()).piece;
+        release(object);
+        Some(piece)
+    }
+}
+
+/// The bytes of `texture`'s piece, if it was cut from a block (diagnostics:
+/// what descriptor slots hold of the pool, `copystat`).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn pooled_len(texture: &ID3D12Resource) -> Option<u64> {
+    piece_of(texture).map(|p| p.len)
+}
+
+/// The block `texture` was cut from, if it was.
+pub(crate) fn block_of(texture: &ID3D12Resource) -> Option<usize> {
+    piece_of(texture).map(|p| p.block)
+}
+
+/// Whether `block` is being drained ([`drain`]): a texture in it lets its
+/// host copy go as soon as it is idle a few frames, and is made again
+/// elsewhere when next used.
+pub(crate) fn draining(block: usize) -> bool {
+    DRAINING.read().unwrap_or_else(|e| e.into_inner()).get(block).copied().unwrap_or(false)
+}
+
+/// Whether any block is being drained.
+pub(crate) fn any_draining() -> bool {
+    DRAINING.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&d| d)
+}
+
+/// The blocks being drained, by their place ([`drain`]).
+static DRAINING: std::sync::RwLock<Vec<bool>> = std::sync::RwLock::new(Vec::new());
+
+/// Marks the blocks to drain, once a second ([`room`]): with more than
+/// [`DRAIN_FREE`] free in the texture blocks, those less than three
+/// quarters used (a quarter left 1.3 GB free in blocks of 4.1 GB, run
+/// ram10-s-move; a half 770 MB in 4.3 GB, run shirt-f). After the world
+/// loads, tens of thousands of textures go idle and are let go, and the few
+/// still used lie in nearly every block: run ram4-held kept 6.9 GB of blocks
+/// for 1.5 GB of textures. New textures go elsewhere while there is room,
+/// the sweep lets the idle ones in them go early (`resource::let_go_idle`)
+/// and moves the ones slots hold (`resource::move_from_drained`), so that
+/// the blocks empty and go.
+/// On with `VICTORY_RESIDENCY=1` (`play.ps1 -LowMemory`), where the card's
+/// memory is the PC's; `VICTORY_POOL_DRAIN=1` or `0` says so either way.
+fn drain<B>(pool: &mut Pool<B>) {
+    mark_drained(pool, drains());
+}
+
+/// Whether blocks are drained ([`drain`]), and copies of textures whose
+/// memory the title gave up go early (`crate::resource::let_go_idle`).
+pub(crate) fn drains() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_POOL_DRAIN").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => crate::residency::on(),
+    })
+}
+
+/// [`drain`]'s marks, if `on`; none otherwise.
+fn mark_drained<B>(pool: &mut Pool<B>, on: bool) {
+    let size = pool.block;
+    let used = |b: &Block<B>| size - b.free.0.values().sum::<u64>();
+    let free: u64 = pool.blocks.iter().flatten().map(|b| size - used(b)).sum();
+    let drain = on && free > DRAIN_FREE;
+    let mut marks = Vec::with_capacity(pool.blocks.len());
+    for block in &mut pool.blocks {
+        let marked = block.as_mut().is_some_and(|b| {
+            b.draining = drain && used(b) * 4 < size * 3 && !b.free.whole(size);
+            b.draining
+        });
+        marks.push(marked);
+    }
+    *DRAINING.write().unwrap_or_else(|e| e.into_inner()) = marks;
+}
+
+/// Free bytes in the texture blocks past which the emptiest are drained.
+const DRAIN_FREE: u64 = 256 << 20;
+
 /// Makes `texture` give `piece` back when the last reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
     let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
@@ -786,6 +906,40 @@ pub(crate) unsafe fn texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nearly_empty_blocks_are_drained_and_new_pieces_go_elsewhere() {
+        // Ten blocks, each with one small piece left: 600 MB free, past the
+        // line, so all are drained.
+        let mut pool: Pool<u32> = Pool::new(16);
+        let small = BLOCK / 16;
+        let mut pieces = Vec::new();
+        for i in 0..10 {
+            pool.add(i, 0);
+            pieces.push(pool.blocks[i as usize].as_mut().unwrap().free.take(small, 1).unwrap());
+        }
+        mark_drained(&mut pool, true);
+        assert!(pool.blocks.iter().flatten().all(|b| b.draining));
+        assert!((0..10).all(draining));
+        // One filled to more than three quarters is not drained.
+        pool.blocks[3].as_mut().unwrap().free.take(BLOCK * 3 / 4, 1).unwrap();
+        mark_drained(&mut pool, true);
+        assert!(!pool.blocks[3].as_ref().unwrap().draining && !draining(3));
+        // A new piece goes into the block not drained, though the drained
+        // ones before it have room.
+        let (piece, memory, _) = pool.take(small, 1, 0, || panic!("no block needed")).unwrap();
+        assert_eq!((piece.block, memory), (3, 3));
+        // Only drained blocks with room: one of them is used, not a new one.
+        pool.blocks[3].as_mut().unwrap().free = Ranges(BTreeMap::new());
+        let (piece, _, _) = pool.take(small, 1, 0, || panic!("no block needed")).unwrap();
+        assert_ne!(piece.block, 3);
+        // Little free: none is drained.
+        let mut full: Pool<u32> = Pool::new(16);
+        full.add(0, 0);
+        full.blocks[0].as_mut().unwrap().free.take(small, 1).unwrap();
+        mark_drained(&mut full, true);
+        assert!(!full.blocks[0].as_ref().unwrap().draining);
+    }
 
     #[test]
     fn a_failed_block_is_not_retried_for_each_small_upload() {
@@ -976,6 +1130,7 @@ mod tests {
         let resting = || lock(&TEXTURES).resting.len();
         let before = resting();
         let other = t.clone();
+        assert!(block_of(&t).is_some() && block_of(&t) == block_of(&other));
         drop(t);
         assert_eq!(resting(), before);
         drop(other);

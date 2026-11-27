@@ -2306,6 +2306,9 @@ impl State {
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
         host.texture_slots_short(frame);
+        // Textures moved out of drained blocks: their new copies filled from
+        // the old ones (made again from them below once that has run).
+        crate::resource::fill_all_moved(list);
         // The slots of textures whose first level with memory (levels on
         // demand), or whose host copy for one with more levels, changed since
         // the last pass are made again from it; those whose new view's upload
@@ -2585,6 +2588,13 @@ impl State {
                 }
             };
             let texture = crate::resource::host_resource(resource);
+            // Moved out of a drained block: filled from the old copy, its
+            // slots made again once that has run.
+            if crate::resource::fill_moved(list, resource) {
+                at_once();
+                host.texture_slot_done(index, write, None);
+                continue;
+            }
             let title_fills = texture.is_some_and(crate::texture::title_written);
             if !title_fills {
                 at_once();
