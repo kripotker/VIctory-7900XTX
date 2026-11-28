@@ -89,6 +89,16 @@ fn all() -> bool {
     *ALL.get_or_init(|| std::env::var("VICTORY_PORT_ALL").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `VICTORY_PORT_REGION_MB=<n>` (a power of two): a region is the n MiB
+/// cells of its stretch around what is asked for, not the whole stretch
+/// (up to [`MOST`]). Unset: the whole stretch, as before.
+fn region_cell() -> Option<u64> {
+    static CELL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("VICTORY_PORT_REGION_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|mb| mb.is_power_of_two()).map(|mb| mb << 20)
+    })
+}
+
 /// A stretch of title memory opened as a heap through a view of ours.
 struct Region {
     start: u64,
@@ -252,6 +262,13 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     let (mut first, mut bytes, mut offset) = (first as u64, bytes as u64, offset);
     if !all() && first < LOW && first + bytes > LOW {
         bytes = LOW.saturating_sub(first);
+    }
+    if let Some(cell) = region_cell() {
+        // Only the cells around what was asked for: opening locks every page
+        // of a region into the PC's memory, the title's untouched ones too.
+        let (lo, hi) = ((at & !(cell - 1)).max(first), end.next_multiple_of(cell).min(first + bytes));
+        offset += lo - first;
+        (first, bytes) = (lo, hi - lo);
     }
     if bytes > MOST {
         // Only what was asked for.
@@ -421,7 +438,11 @@ pub(crate) fn log(frames: f64) {
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     let per: Vec<f64> = STATS[9..].iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
-    tracing::info!(
+    let (alive, alive_bytes) = {
+        let regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+        (regions.len(), regions.keys().map(|(start, end)| end - start).sum::<u64>())
+    };
+    tracing::info!(alive, alive_mb = alive_bytes >> 20, region_mb = region_cell().map_or(0, |c| c >> 20),
         "renderer port 1 (VICTORY_PORT_CONSTANTS=1): {} regions of the title's graphics memory in place ({} MB), {} title buffers and windows placed in them \
          (no host copy, nothing sent up or fetched back for them); per frame on the CPU: {:.0} fills read out of them ({:.1} KB), {:.1} buffer copies \
          touching them ({:.1} KB); since the start refused: {} not one stretch of a section, {} not committed, {} by the host, {} no buffer; {} regions \
