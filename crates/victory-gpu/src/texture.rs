@@ -437,6 +437,29 @@ thread_local! {
 /// Calls `f` with `size` bytes of this thread's read buffer (their
 /// contents are whatever the last texture left).
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    // A buffer per thread grew to the biggest texture its thread ever read
+    // (run slab1: ~295 MB over ~14 threads); big reads share a few warm
+    // buffers instead.
+    const KEPT: usize = 4 << 20;
+    if size > KEPT {
+        static BIG: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+        let taken = {
+            let mut big = BIG.lock().unwrap_or_else(|e| e.into_inner());
+            // The smallest that fits, else the biggest (grown below).
+            let fits = (0..big.len()).filter(|&i| big[i].len() >= size).min_by_key(|&i| big[i].len());
+            fits.or_else(|| (0..big.len()).max_by_key(|&i| big[i].len())).map(|i| big.swap_remove(i))
+        };
+        let mut read = taken.unwrap_or_default();
+        if read.len() < size {
+            read.resize(size, 0);
+        }
+        let done = f(&mut read[..size]);
+        let mut big = BIG.lock().unwrap_or_else(|e| e.into_inner());
+        if big.len() < 4 {
+            big.push(read);
+        }
+        return done;
+    }
     READ.with(|read| {
         let mut read = read.borrow_mut();
         if read.len() < size {
