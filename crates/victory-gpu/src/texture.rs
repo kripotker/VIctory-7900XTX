@@ -1414,6 +1414,21 @@ impl Staging {
     /// pages that are there ([`Staging::fill`]). Returns the bytes read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        // A staging buffer filled before keeps what it holds until a refresh
+        // that holds title memory still: a read now may take pages the remap
+        // is taking away, and timing alone decided whether the floral shirt
+        // at the boat showed neon 4x4 blocks (4 runs of 4 with stack captures
+        // in the allocator, 2026-11-28; none waiting for the remap).
+        // `VICTORY_TEXTURE_UNLOCKED_REFILL=1`: read it now, as before.
+        static REFILL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if last.hash.is_some()
+            && !*REFILL.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_UNLOCKED_REFILL").is_some_and(|v| v == "1"))
+        {
+            UNLOCKED[1].fetch_add(1, Relaxed);
+            last.unsettled = true;
+            last.asked = 0;
+            return 0;
+        }
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
                 return false;
