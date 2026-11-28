@@ -102,6 +102,16 @@ fn resident(at: usize, len: usize) -> u64 {
 pub(crate) fn census() {
     // Committed bytes and whether write-combined, by allocation base.
     let mut allocations: HashMap<usize, (u64, bool, u64)> = HashMap::new();
+    // The title's range is not counted, and not walked either: its page
+    // views are ~250,000 regions (0.9 s of questions, each holding the
+    // process's memory map: the title's page mappings waited behind them,
+    // up to 114 ms a question in run tl1's streaming).
+    const TITLE: std::ops::Range<usize> = 0x1_0000_0000..0x110_0000_0000;
+    // Every region walked (start, end, allocation base), in order: our
+    // buffers' allocations are looked up here, not asked about one by one
+    // (two questions per buffer, ~20,000, each waiting behind the title's
+    // page mappings: 20 ms a frame of the meter thread in run tl2).
+    let mut regions: Vec<(usize, usize, usize)> = Vec::new();
     let mut at = 0usize;
     loop {
         // SAFETY: plain data the query fills in.
@@ -111,23 +121,27 @@ pub(crate) fn census() {
             break;
         }
         let base = info.BaseAddress as usize;
-        let title = (0x1_0000_0000..0x110_0000_0000).contains(&base);
-        if info.State == mem::MEM_COMMIT && info.Type == mem::MEM_PRIVATE && !title {
+        if info.State != mem::MEM_FREE {
+            regions.push((base, base.saturating_add(info.RegionSize), info.AllocationBase as usize));
+        }
+        if info.State == mem::MEM_COMMIT && info.Type == mem::MEM_PRIVATE && !TITLE.contains(&base) {
             let e = allocations.entry(info.AllocationBase as usize).or_default();
             e.0 += info.RegionSize as u64;
             e.1 |= info.Protect & mem::PAGE_WRITECOMBINE != 0;
             e.2 += resident(base, info.RegionSize);
         }
         at = base.saturating_add(info.RegionSize);
+        if TITLE.contains(&at) {
+            at = TITLE.end;
+        }
         if at >= 0x7fff_ffff_0000 {
             break;
         }
     }
     let base_of = |cpu: usize| {
-        // SAFETY: as above.
-        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: as above.
-        (unsafe { mem::VirtualQuery(cpu as *const _, &mut info, size_of_val(&info)) } != 0).then_some(info.AllocationBase as usize)
+        let i = regions.partition_point(|r| r.0 <= cpu).checked_sub(1)?;
+        let (start, end, base) = regions[i];
+        (start..end).contains(&cpu).then_some(base)
     };
     let live: Vec<(usize, u64, &'static Location<'static>)> = LIVE
         .lock()

@@ -2624,8 +2624,32 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    let t = std::time::Instant::now();
     crate::texback::remapped(at, len);
-    open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
+    remap_cost(0, t);
+    let mut g = title_memory_changed(at, len);
+    let t = std::time::Instant::now();
+    open(&mut g, at, at.saturating_add(len));
+    remap_cost(5, t);
+}
+
+/// Nanoseconds the runtime's page mappings spent in our callbacks, by part:
+/// 0 `texback::remapped`, 1 `descriptor::host::remapped`, 2
+/// `inplace::views_gone`, 3 `inplace::title_memory_freeing`, 4 waiting for
+/// the guards, 5 opening guarded blocks again; inside 3: 6 `port::forget`,
+/// 7 `shadow::in_place_let_go`.
+static REMAP_COSTS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+pub(crate) fn remap_cost(part: usize, since: std::time::Instant) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    REMAP_COSTS[part].fetch_add((now - since).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    now
+}
+
+/// [`REMAP_COSTS`] since the last call, in milliseconds (for the runtime's
+/// log of slow page mappings).
+pub fn take_remap_costs() -> [f64; 8] {
+    std::array::from_fn(|i| REMAP_COSTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6)
 }
 
 /// The runtime is about to unmap title memory `[at, at + len)`: it is
@@ -2634,7 +2658,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    let t = std::time::Instant::now();
     crate::texback::remapped(at, len);
+    remap_cost(0, t);
     let mut g = title_memory_changed(at, len);
     if CHANGING.get().0 && len != 0 {
         CHANGING.set((true, true));
@@ -2711,14 +2737,19 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
 fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
+    let t = std::time::Instant::now();
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
+    let t = remap_cost(1, t);
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
+    let t = remap_cost(2, t);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    let t = remap_cost(3, t);
     let mut g = guards();
+    remap_cost(4, t);
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).collect();
     for block in absent {

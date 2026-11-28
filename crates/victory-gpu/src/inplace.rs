@@ -189,12 +189,15 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
+    let t = std::time::Instant::now();
     // Renderer port 1's regions there: no longer what the title shows.
     crate::port::forget(at, len);
+    let t = crate::watch::remap_cost(6, t);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
     let gone = crate::shadow::in_place_let_go(at as u64, len as u64);
+    crate::watch::remap_cost(7, t);
     STATS[7].fetch_add(gone, Ordering::Relaxed);
 }
 

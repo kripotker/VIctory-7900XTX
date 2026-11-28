@@ -1294,10 +1294,20 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let _costed = Costed::begin(None);
     let _busy = Busy::begin();
+    let began = std::time::Instant::now();
     let mut physical = physical();
+    let tabled = std::time::Instant::now();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
+    let changing = std::time::Instant::now();
     unmap(&mut physical, to, len);
+    ALIAS_PHASES.with(|p| {
+        let mut sum = p.get();
+        for (s, d) in sum.iter_mut().zip([tabled - began, changing - tabled, changing.elapsed()]) {
+            *s += d.as_nanos() as u64;
+        }
+        p.set(sum);
+    });
     if from == 0 {
         return true;
     }
@@ -1356,12 +1366,59 @@ fn join_placeholders(physical: &mut Physical, base: usize, len: usize) -> bool {
     joined
 }
 
+thread_local! {
+    /// Of this thread's [`map_alias`] calls, nanoseconds: waiting for
+    /// [`PHYSICAL`], waiting for reads in place to end, unmapping.
+    static ALIAS_PHASES: std::cell::Cell<[u64; 7]> = const { std::cell::Cell::new([0; 7]) };
+}
+
+/// Adds to this thread's [`ALIAS_PHASES`] entry `i` (3 and 4: unmapping, our
+/// callbacks and the system call; 5 and 6: mapping, the system calls and our
+/// callbacks).
+fn alias_phase(i: usize, d: std::time::Duration) {
+    ALIAS_PHASES.with(|p| {
+        let mut sum = p.get();
+        sum[i] += d.as_nanos() as u64;
+        p.set(sum);
+    });
+}
+
 /// [`map_alias`] of many ranges, in order.
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     let _costed = Costed::begin(None);
     lift_thread();
     if side_by_side() <= 1 {
-        return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
+        let began = std::time::Instant::now();
+        ALIAS_PHASES.with(|p| p.set([0; 7]));
+        victory_gpu::take_remap_costs();
+        let ok = ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
+        let ms = began.elapsed().as_secs_f64() * 1e3;
+        // The title's page mappings are on its streaming thread's way, and
+        // the frame waits for them (run tl1: 173-699 ms calls in the frames
+        // of 250-600 ms): the slow ones, with where their time went.
+        if ms >= 50.0 {
+            let [table, reads, unmapping, unmap_told, unmap_calls, map_calls, map_told] =
+                ALIAS_PHASES.with(|p| p.get()).map(|ns| ns as f64 / 1e6);
+            let pages: u64 = ranges.iter().map(|r| r.2 / PAGE as u64).sum();
+            let mapped = ranges.iter().filter(|r| r.1 != 0).count();
+            tracing::warn!(
+                ms = format_args!("{ms:.1}"),
+                ranges = ranges.len(),
+                mapped,
+                pages,
+                page_table_ms = format_args!("{table:.1}"),
+                reads_in_place_ms = format_args!("{reads:.1}"),
+                unmapping_ms = format_args!("{unmapping:.1}"),
+                mapping_ms = format_args!("{:.1}", ms - table - reads - unmapping),
+                unmap_callbacks_ms = format_args!("{unmap_told:.1}"),
+                unmap_calls_ms = format_args!("{unmap_calls:.1}"),
+                map_calls_ms = format_args!("{map_calls:.1}"),
+                map_callbacks_ms = format_args!("{map_told:.1}"),
+                callback_parts_ms = ?victory_gpu::take_remap_costs().map(|ms| (ms * 10.0).round() / 10.0),
+                "a slow batch of the title's page mappings"
+            );
+        }
+        return ok;
     }
     // By the page: the address, and the one whose page it is to show.
     let pages: Vec<(usize, Option<usize>)> = ranges
@@ -1377,7 +1434,9 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     let mut at = 0;
     while at < pages.len() {
         let _busy = Busy::begin();
+        let waiting = victory_gpu::timeline::span("page mappings: waiting for the page table");
         let mut physical = physical();
+        drop(waiting);
         let mut ops: Vec<Op> = Vec::new();
         let mut touched = std::collections::HashSet::new();
         for &(to, from) in &pages[at..] {
@@ -1392,7 +1451,10 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
             ops.push(Op::new(to, slice.flatten()));
             at += 1;
         }
+        let waiting = victory_gpu::timeline::span("page mappings: waiting for reads in place");
         let _changing = victory_gpu::title_memory_remapping();
+        drop(waiting);
+        let _changing_now = victory_gpu::timeline::span("page mappings: a group changed");
         ok &= change(&mut physical, ops);
     }
     ok
@@ -1610,7 +1672,9 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
             op.own = true;
         }
     }
+    let calls = victory_gpu::timeline::span("page mappings: the system calls");
     let done = pool::all(ops);
+    drop(calls);
     let mut ok = true;
     for (op, done) in done {
         match op.slice {
@@ -1754,9 +1818,12 @@ mod pool {
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     let own = physical.holes.remove(&base) == Some(len) && lean();
+    let showing = std::time::Instant::now();
     if !show(base, len, &slice, own) {
         return false;
     }
+    alias_phase(5, showing.elapsed());
+    let telling = std::time::Instant::now();
     // Noted before the GPU side is told: bytes DirectStorage put in earlier,
     // without notice at these addresses ([`pages_written`]), are there by
     // the time the copies of them go.
@@ -1765,6 +1832,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
+    alias_phase(6, telling.elapsed());
     physical.views.insert(base, (len, slice));
     true
 }
@@ -1914,7 +1982,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             // Parts of it stay, and are mapped again below.
             victory_gpu::title_memory_splitting(at, size);
         }
+        let told = std::time::Instant::now();
         victory_gpu::title_memory_unmapping(at, size);
+        let calling = std::time::Instant::now();
         // SAFETY: a view we mapped; it becomes a placeholder again.
         let gone = counted(Call::Unmap, || unsafe {
             UnmapViewOfFile2(
@@ -1925,6 +1995,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         });
+        alias_phase(3, calling - told);
+        alias_phase(4, calling.elapsed());
         if gone != 0 && at >= base && at + size <= end {
             physical.holes.insert(at, size);
         }
