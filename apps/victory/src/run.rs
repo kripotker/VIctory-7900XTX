@@ -49,6 +49,7 @@ pub fn run(
 
     if execute {
         check_cpu_features()?;
+        victory_hle::modules::xmem::cap_working_set();
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();

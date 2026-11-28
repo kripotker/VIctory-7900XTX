@@ -2036,6 +2036,41 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     unsafe { VirtualFree(address, size, kind) }
 }
 
+/// `VICTORY_WORKING_SET_MB=<n>` (1024 at least): the process keeps at most
+/// n MiB resident (a hard working-set maximum). Windows keeps what was used
+/// lately and compresses or pages out the rest; a touch brings a page
+/// back. Series X at the boat (runs trim1, cap8a): after an emptied working
+/// set only 8.7 of ~17.7 GB came back in 75 s; held to 8192 from the
+/// start, peak RAM was 15.1 GB against 18.0, frames as fast, the shirt
+/// clean. Pages the driver locks for the card are not counted. Unset: no
+/// limit.
+pub fn cap_working_set() {
+    use windows_sys::Win32::System::Memory::{
+        QUOTA_LIMITS_HARDWS_MAX_ENABLE, QUOTA_LIMITS_HARDWS_MIN_DISABLE, SetProcessWorkingSetSizeEx,
+    };
+    let Some(mb) = std::env::var("VICTORY_WORKING_SET_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()) else {
+        return;
+    };
+    if mb < 1024 {
+        tracing::warn!(mb, "VICTORY_WORKING_SET_MB below 1024 ignored");
+        return;
+    }
+    // SAFETY: our own process; plain quota change.
+    let ok = unsafe {
+        SetProcessWorkingSetSizeEx(
+            GetCurrentProcess(),
+            256 * MIB,
+            mb * MIB,
+            QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE,
+        )
+    };
+    if ok == 0 {
+        tracing::warn!(mb, error = %std::io::Error::last_os_error(), "the working-set limit was refused");
+    } else {
+        tracing::info!(mb, "resident memory held to a working-set limit (VICTORY_WORKING_SET_MB)");
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "xmem",
