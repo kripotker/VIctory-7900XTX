@@ -92,6 +92,9 @@ fn all() -> bool {
 /// `VICTORY_PORT_REGION_MB=<n>` (a power of two): a region is the n MiB
 /// cells of its stretch around what is asked for, not the whole stretch
 /// (up to [`MOST`]). Unset: the whole stretch, as before.
+/// Experimental, not for play: at 4 MiB (Series X, 3 runs) it kept
+/// 0.2–0.4 GiB less resident, but one run showed garbage on a texture and
+/// one had three frames over 1.5 s.
 fn region_cell() -> Option<u64> {
     static CELL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *CELL.get_or_init(|| {
