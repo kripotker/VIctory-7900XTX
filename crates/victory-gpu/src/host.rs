@@ -1390,7 +1390,11 @@ const BATCHES: u32 = 8;
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
-    allocator: ID3D12CommandAllocator,
+    /// Its own allocator, without shared ones ([`crate::slab`]).
+    allocator: Option<ID3D12CommandAllocator>,
+    /// The shared allocators it recorded into since its reset (`slab`):
+    /// the list's own and its prelude's.
+    uses: Mutex<Vec<crate::slab::Use>>,
     /// With barriers held and joined (`rec`).
     pub(crate) list: rec::Rec,
     /// Work for submission time, in recorded order.
@@ -4345,17 +4349,24 @@ impl Host {
     fn make_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
         unsafe {
-            let allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let mut uses = Vec::new();
+            let allocator: ID3D12CommandAllocator = if crate::slab::on() {
+                let shared = crate::slab::take(&self.device)?;
+                let allocator = shared.allocator().clone();
+                uses.push(shared);
+                allocator
+            } else {
+                self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?
+            };
             let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
                 0,
                 D3D12_COMMAND_LIST_TYPE_DIRECT,
                 &allocator,
                 None,
             )?;
+            let allocator = uses.is_empty().then_some(allocator);
             let prelude = OnceLock::new();
-            if !lazy_prelude() {
+            if !lazy_prelude() && !crate::slab::on() {
                 let _ = prelude.set(self.make_prelude(None));
             }
             #[cfg(feature = "diagnostics")]
@@ -4383,6 +4394,7 @@ impl Host {
             }
             Ok(HostList {
                 allocator,
+                uses: Mutex::new(uses),
                 list: rec::Rec::new(list),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
@@ -6628,6 +6640,7 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+        self.uses.lock().unwrap_or_else(|e| e.into_inner()).iter_mut().for_each(crate::slab::Use::closed);
     }
 
     /// `work` finds, on a thread of ours, refreshes that belong at this
@@ -6655,6 +6668,14 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.clear();
+        self.open();
+    }
+
+    /// What [`HostList::reset`] does but open the list again: what it kept
+    /// for its commands goes, and its shared allocators (a closed list in
+    /// the idle pool keeps none other lists could record into).
+    pub(crate) fn clear(&self) {
         self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -6678,17 +6699,33 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        // SAFETY: the list is not executing.
+        // Its recordings have run: the allocators may be reset once no
+        // other list's commands in them may still run.
+        self.uses.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// Opens a cleared list ([`HostList::clear`]) for recording.
+    pub(crate) fn open(&self) {
+        // SAFETY: the list is closed and not executing; an allocator of its
+        // own only it records into, a shared one only the holder of its use.
         let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
+            match &self.allocator {
+                Some(allocator) => allocator.Reset().and_then(|()| self.list.Reset(allocator, None)),
+                None => host()
+                    .ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))
+                    .and_then(|h| crate::slab::take(&h.device))
+                    .and_then(|shared| {
+                        self.list.Reset(shared.allocator(), None)?;
+                        self.uses.lock().unwrap_or_else(|e| e.into_inner()).push(shared);
+                        Ok(())
+                    }),
+            }
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
 
     /// Something changed in this list that bringing a draw's textures and
@@ -7030,17 +7067,29 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
-        let shared = shared_prelude();
+        // With shared allocators ([`crate::slab`]) the prelude records into
+        // one taken for it, kept with the list's own until its reset.
+        let mut slab = match &self.allocator {
+            Some(_) => None,
+            None => match host().map(|h| crate::slab::take(&h.device)) {
+                Some(Ok(shared)) => Some(shared),
+                _ => fail(format_args!("no host allocator for a state prelude")),
+            },
+        };
+        let shared = slab.is_some() || shared_prelude();
+        let own = if shared { self.allocator.as_ref() } else { None };
         let Some((allocator, list)) = self
             .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude(shared.then_some(&self.allocator))))
+            .get_or_init(|| host().and_then(|h| h.make_prelude(slab.as_ref().map(crate::slab::Use::allocator).or(own))))
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
         };
+        let allocator = slab.as_ref().map_or(allocator, crate::slab::Use::allocator);
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures are live. A shared allocator is the list's,
-        // which only the list's reset resets.
+        // which only the list's reset resets, or one only this use records
+        // into now.
         let recorded = unsafe {
             (if shared { Ok(()) } else { allocator.Reset() }).and_then(|()| {
                 list.Reset(allocator, None)?;
@@ -7058,6 +7107,10 @@ impl HostList {
         };
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
+        }
+        if let Some(mut slab) = slab.take() {
+            slab.closed();
+            self.uses.lock().unwrap_or_else(|e| e.into_inner()).push(slab);
         }
         list.cast().ok()
     }

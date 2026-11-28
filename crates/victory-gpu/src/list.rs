@@ -256,7 +256,13 @@ fn fresh_list() -> Option<crate::host::HostList> {
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _)) => {
+            // Kept closed with shared allocators (`crate::slab`).
+            if crate::slab::on() {
+                list.open();
+            }
+            Some(list)
+        }
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -278,8 +284,13 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
-        // goes, its allocators stay.
-        host.reset();
+        // goes, its allocators stay (shared ones go back, and the list
+        // stays closed till it is taken).
+        if crate::slab::on() {
+            host.clear();
+        } else {
+            host.reset();
+        }
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {

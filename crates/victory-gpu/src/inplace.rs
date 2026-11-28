@@ -1464,6 +1464,12 @@ pub(crate) mod tests {
             unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
             c.PagefileUsage as f64 / (1 << 20) as f64
         };
+        let resident = || {
+            let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+            // SAFETY: as above.
+            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+            c.WorkingSetSize as f64 / (1 << 20) as f64
+        };
         // SAFETY: plain DXGI queries and object creation on the first card.
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
@@ -1472,7 +1478,7 @@ pub(crate) mod tests {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
             let device = device.unwrap();
             const N: usize = 200;
-            let before = commit();
+            let (before, before_ws) = (commit(), resident());
             let pairs: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> = (0..N)
                 .map(|_| {
                     let a: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
@@ -1480,7 +1486,22 @@ pub(crate) mod tests {
                     (a, l)
                 })
                 .collect();
-            let made = commit();
+            let (made, made_ws) = (commit(), resident());
+            // A short recording, as most host lists are, then a reset.
+            for (a, l) in &pairs {
+                for _ in 0..200 {
+                    l.OMSetStencilRef(1);
+                }
+                l.Close().unwrap();
+                a.Reset().unwrap();
+                l.Reset(a, None).unwrap();
+            }
+            let short_ws = resident();
+            println!(
+                "resident per list: {:.2} MB made (allocator + list), {:.2} MB after a 200-command recording",
+                (made_ws - before_ws) / N as f64,
+                (short_ws - before_ws) / N as f64
+            );
             for (a, l) in &pairs {
                 for _ in 0..300_000 {
                     l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1492,7 +1513,7 @@ pub(crate) mod tests {
             }
             let recorded = commit();
             let shared: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
-            let before_lists = commit();
+            let (before_lists, before_lists_ws) = (commit(), resident());
             let lists: Vec<ID3D12GraphicsCommandList> = (0..N)
                 .map(|_| {
                     let l: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &shared, None).unwrap();
@@ -1500,7 +1521,20 @@ pub(crate) mod tests {
                     l
                 })
                 .collect();
-            let lists_only = commit();
+            let (lists_only, lists_only_ws) = (commit(), resident());
+            // Each of them records a little on the shared allocator in turn.
+            for l in &lists {
+                l.Reset(&shared, None).unwrap();
+                for _ in 0..200 {
+                    l.OMSetStencilRef(1);
+                }
+                l.Close().unwrap();
+            }
+            println!(
+                "resident per list on one shared allocator: {:.2} MB made, {:.2} MB after each recorded 200 commands",
+                (lists_only_ws - before_lists_ws) / N as f64,
+                (resident() - before_lists_ws) / N as f64
+            );
             let allocators: Vec<ID3D12CommandAllocator> =
                 (0..N).map(|_| device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap()).collect();
             let allocators_only = commit();
@@ -1561,6 +1595,111 @@ pub(crate) mod tests {
             buffers.len(),
             one_heap as i64 - before as i64
         );
+    }
+
+    /// Measurement on the real card (ignored: needs one): what a committed
+    /// buffer in the PC's memory costs the process (commit and resident),
+    /// by size and kind, against the same buffers placed in one heap.
+    /// `cargo test -p victory-gpu --lib -- --ignored --nocapture buffers_cost`
+    #[test]
+    #[ignore]
+    fn buffers_cost() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let counters = || {
+            let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+            // SAFETY: our own process and a sized structure.
+            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+            [c.PagefileUsage as f64, c.WorkingSetSize as f64]
+        };
+        // SAFETY: plain DXGI queries and device creation on the first card.
+        let device: ID3D12Device = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter = factory.EnumAdapters1(0).unwrap();
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            device.unwrap()
+        };
+        let shared = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let upload = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() };
+        let desc = |size: u64, uav: bool| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: if uav { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS } else { D3D12_RESOURCE_FLAG_NONE },
+            ..Default::default()
+        };
+        const N: usize = 256;
+        for (kind, props, uav, state) in [
+            ("shared", shared, true, D3D12_RESOURCE_STATE_COMMON),
+            ("upload", upload, false, D3D12_RESOURCE_STATE_GENERIC_READ),
+        ] {
+            for size in [256u64, 4 << 10, 64 << 10, 256 << 10, 1 << 20, 4 << 20] {
+                let before = counters();
+                let mut kept = Vec::new();
+                for _ in 0..N {
+                    let mut b: Option<ID3D12Resource> = None;
+                    let mut data = std::ptr::null_mut();
+                    // SAFETY: plain creation and mapping of a buffer.
+                    unsafe {
+                        device.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc(size, uav), state, None, &mut b).unwrap();
+                        let b = b.unwrap();
+                        b.Map(0, None, Some(&mut data)).unwrap();
+                        kept.push(b);
+                    }
+                }
+                let after = counters();
+                println!(
+                    "{kind} committed {:>8} B: commit {:>9.1} KiB, resident {:>9.1} KiB a buffer",
+                    size,
+                    (after[0] - before[0]) / N as f64 / 1024.0,
+                    (after[1] - before[1]) / N as f64 / 1024.0
+                );
+                drop(kept);
+            }
+            // The same as buffers of 64 KiB placed in one heap.
+            let before = counters();
+            let heap_desc = D3D12_HEAP_DESC {
+                SizeInBytes: (N * K64) as u64,
+                Properties: props,
+                Alignment: K64 as u64,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            let mut kept = Vec::new();
+            // SAFETY: plain creation of a heap and buffers placed in it.
+            unsafe {
+                device.CreateHeap(&heap_desc, &mut heap).unwrap();
+                let heap = heap.unwrap();
+                for i in 0..N {
+                    let mut b: Option<ID3D12Resource> = None;
+                    let mut data = std::ptr::null_mut();
+                    device.CreatePlacedResource(&heap, (i * K64) as u64, &desc(K64 as u64, uav), state, None, &mut b).unwrap();
+                    let b = b.unwrap();
+                    b.Map(0, None, Some(&mut data)).unwrap();
+                    kept.push(b);
+                }
+                let after = counters();
+                println!(
+                    "{kind} placed in one heap, 64 KiB each: commit {:.1} KiB, resident {:.1} KiB a buffer",
+                    (after[0] - before[0]) / N as f64 / 1024.0,
+                    (after[1] - before[1]) / N as f64 / 1024.0
+                );
+                drop(kept);
+                drop(heap);
+            }
+        }
     }
 
     #[test]

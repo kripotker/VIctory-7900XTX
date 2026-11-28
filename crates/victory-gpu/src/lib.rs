@@ -48,6 +48,8 @@ mod book;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod slab;
+#[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;

@@ -462,6 +462,100 @@ fn big_blocks() -> String {
     if text.is_empty() { "none".into() } else { text.join(", ") }
 }
 
+/// Our own blocks of 1 MiB and more alive now, with the stack that made
+/// each (return addresses, captured without allocating): the census sees
+/// ~500 MB of them in ~50 blocks and nothing says whose they are.
+const MID: usize = 1 << 20;
+const MID_FRAMES: usize = 14;
+static MID_AT: [std::sync::atomic::AtomicUsize; 512] = [const { std::sync::atomic::AtomicUsize::new(0) }; 512];
+static MID_BYTES: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
+static MID_STACK: [[AtomicU64; MID_FRAMES]; 512] = [const { [const { AtomicU64::new(0) }; MID_FRAMES] }; 512];
+
+/// The same for our blocks under 1 MiB, one address in 1024 (by a hash of
+/// it, so a block's free finds it): 1.7 M blocks, 0.77 GB in gameplay, and
+/// 0.83 M of them already in the loading screen.
+static SMALL_AT: [std::sync::atomic::AtomicUsize; 8192] = [const { std::sync::atomic::AtomicUsize::new(0) }; 8192];
+static SMALL_BYTES: [AtomicU64; 8192] = [const { AtomicU64::new(0) }; 8192];
+static SMALL_STACK: [[AtomicU64; MID_FRAMES]; 8192] = [const { [const { AtomicU64::new(0) }; MID_FRAMES] }; 8192];
+
+/// Whether blocks under 1 MiB are sampled (`VICTORY_SAMPLE_SMALL=1`, read
+/// at the first memory line, outside the allocator): the stack captures
+/// change timing enough that the neon 4x4 blocks on the boat's floral shirt
+/// came in 4 runs of 4 with them (2026-11-28) and in none without.
+static SMALL_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn sampled(at: *mut u8) -> bool {
+    ((at as u64 >> 4).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 54) == 0
+}
+
+fn mid(at: *mut u8, size: usize, made: bool) {
+    let (places, sizes, stacks): (&[std::sync::atomic::AtomicUsize], &[AtomicU64], &[[AtomicU64; MID_FRAMES]]) = if size >= MID {
+        (&MID_AT, &MID_BYTES, &MID_STACK)
+    } else if SMALL_ON.load(Relaxed) && sampled(at) {
+        (&SMALL_AT, &SMALL_BYTES, &SMALL_STACK)
+    } else {
+        return;
+    };
+    for (i, place) in places.iter().enumerate() {
+        if made {
+            if place.compare_exchange(0, at as usize, Relaxed, Relaxed).is_ok() {
+                sizes[i].store(size as u64, Relaxed);
+                let mut frames = [std::ptr::null_mut(); MID_FRAMES];
+                use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+                // SAFETY: a buffer of MID_FRAMES pointers; no allocation.
+                let n = unsafe { RtlCaptureStackBackTrace(2, MID_FRAMES as u32, frames.as_mut_ptr(), std::ptr::null_mut()) };
+                for (slot, frame) in stacks[i].iter().zip(frames.iter().take(n as usize).chain(std::iter::repeat(&std::ptr::null_mut()))) {
+                    slot.store(*frame as u64, Relaxed);
+                }
+                return;
+            }
+        } else if place.load(Relaxed) == at as usize {
+            sizes[i].store(0, Relaxed);
+            place.store(0, Relaxed);
+            return;
+        }
+    }
+}
+
+/// Logs our blocks of 1 MiB and more, grouped by the stack that made them
+/// (`victory.exe+offset` frames, for the scratchpad's symbolizer).
+fn log_mid_blocks() {
+    static READ: std::sync::Once = std::sync::Once::new();
+    READ.call_once(|| SMALL_ON.store(std::env::var_os("VICTORY_SAMPLE_SMALL").is_some_and(|v| v == "1"), Relaxed));
+    static N: AtomicU64 = AtomicU64::new(0);
+    if !N.fetch_add(1, Relaxed).is_multiple_of(6) {
+        return;
+    }
+    log_blocks(&MID_AT, &MID_BYTES, &MID_STACK, 1, "our blocks of 1 MiB and more");
+    log_blocks(&SMALL_AT, &SMALL_BYTES, &SMALL_STACK, 1024, "our blocks under 1 MiB (one in 1024 sampled, counts scaled)");
+}
+
+fn log_blocks(places: &[std::sync::atomic::AtomicUsize], sizes: &[AtomicU64], stacks: &[[AtomicU64; MID_FRAMES]], scale: u64, what: &str) {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    // SAFETY: the executable's own handle.
+    let base = unsafe { GetModuleHandleW(std::ptr::null()) } as u64;
+    let mut by_stack: std::collections::HashMap<Vec<u64>, (u64, u64)> = std::collections::HashMap::new();
+    for (i, place) in places.iter().enumerate() {
+        let bytes = sizes[i].load(Relaxed);
+        if place.load(Relaxed) == 0 || bytes == 0 {
+            continue;
+        }
+        let stack: Vec<u64> = stacks[i].iter().map(|f| f.load(Relaxed)).take_while(|&f| f != 0).collect();
+        let e = by_stack.entry(stack).or_default();
+        e.0 += scale;
+        e.1 += bytes * scale;
+    }
+    let mut groups: Vec<_> = by_stack.into_iter().collect();
+    groups.sort_by_key(|(_, e)| std::cmp::Reverse(e.1));
+    for (stack, (n, bytes)) in groups.iter().take(24) {
+        let frames: Vec<String> = stack
+            .iter()
+            .map(|&f| if f >= base && f - base < 1 << 30 { format!("victory.exe+{:#x}", f - base) } else { format!("{f:#x}") })
+            .collect();
+        tracing::info!("{what}: {n} blocks {:.1} MB made at {}", *bytes as f64 / (1 << 20) as f64, frames.join(" "));
+    }
+}
+
 /// Allocation bases our small blocks were seen in (one block in 1024 looked
 /// up): the process heap's segments, for the census (`crate::alive`).
 pub(crate) static HEAP_BASES: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
@@ -502,6 +596,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
+            mid(at, layout.size(), true);
             heap_sample(at);
         }
         at
@@ -513,6 +608,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
+            mid(at, layout.size(), true);
         }
         at
     }
@@ -520,6 +616,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn dealloc(&self, at: *mut u8, layout: std::alloc::Layout) {
         own(layout.size(), false);
         big(at, layout.size(), false);
+        mid(at, layout.size(), false);
         // SAFETY: the caller's contract, passed on.
         unsafe { std::alloc::System.dealloc(at, layout) };
     }
@@ -532,6 +629,8 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
             own(size, true);
             big(at, layout.size(), false);
             big(moved, size, true);
+            mid(at, layout.size(), false);
+            mid(moved, size, true);
         }
         moved
     }
@@ -1025,8 +1124,9 @@ fn log_memory() {
     let views = crate::descriptor::views_kept();
     let own: Vec<u64> = (0..8).map(owned).collect();
     tracing::info!(
-        "memory, what holds it: {} host lists alive; their scratch memory: {} chunks {:.0} MB, of          them {} chunks {:.0} MB spare ({} taken from the spare ones so far); their other upload          buffers: {} alive {:.0} MB; windows outside buffers (grid {} KiB): {:.0} MB of their          pages ever copied, {} shown by descriptor slots {:.0} MB, {} held by lists or the pass          over the heap {:.0} MB, {} asked for without a length {:.0} MB; buffer views of the heap          whose slot showed another copy than the one brought up to date: {}; distinct views          kept: {} ({} free) {:.0} MB; our own allocations: {:.0} MB in {} blocks (under 4 KiB          {:.0} MB in {}, to 64 KiB {:.0} MB in {}, to 1 MiB {:.0} MB in {}, larger {:.0} MB in {})",
+        "memory, what holds it: {} host lists alive ({} shared command allocators); their scratch memory: {} chunks {:.0} MB, of          them {} chunks {:.0} MB spare ({} taken from the spare ones so far); their other upload          buffers: {} alive {:.0} MB; windows outside buffers (grid {} KiB): {:.0} MB of their          pages ever copied, {} shown by descriptor slots {:.0} MB, {} held by lists or the pass          over the heap {:.0} MB, {} asked for without a length {:.0} MB; buffer views of the heap          whose slot showed another copy than the one brought up to date: {}; distinct views          kept: {} ({} free) {:.0} MB; our own allocations: {:.0} MB in {} blocks (under 4 KiB          {:.0} MB in {}, to 64 KiB {:.0} MB in {}, to 1 MiB {:.0} MB in {}, larger {:.0} MB in {})",
         alive[0],
+        crate::slab::ALIVE.load(Relaxed),
         alive[1],
         mb(alive[2]),
         alive[3],
@@ -1084,6 +1184,7 @@ fn log_memory() {
         mb(kept[6]),
         big_blocks(),
     );
+    log_mid_blocks();
     // Round 3: whether windows hold the same memory more than once (they
     // can, once they are cut finer than 4 MiB), and how many host lists
     // the title made and never used.
